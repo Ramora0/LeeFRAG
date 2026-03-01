@@ -492,6 +492,7 @@ def evaluate(
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
     n_samples = min(len(raw_dataset), max_samples)
+    verbose = n_samples <= 10 and not ce_only
     logger.info(f"Evaluating on {n_samples} samples from {dataset_name}")
 
     # Condition names: full_context, compressed_Nx (per ratio), no_prefix
@@ -569,6 +570,8 @@ def evaluate(
 
         # === Generation (F1 / EM) ===
         if not ce_only:
+            sample_gens = {}  # {condition: gen_text} for verbose printing
+
             # Full context generation
             try:
                 gen_tokens = generate_full_context(model, full_prompt_ids, device)
@@ -576,6 +579,8 @@ def evaluate(
                 accum["full_context"][2] += compute_f1(gen_text, gold_answer)
                 accum["full_context"][3] += compute_em(gen_text, gold_answer)
                 accum["full_context"][4] += 1
+                if verbose:
+                    sample_gens["full_context"] = gen_text
             except torch.cuda.OutOfMemoryError:
                 torch.cuda.empty_cache()
 
@@ -591,6 +596,8 @@ def evaluate(
                     accum[cond][2] += compute_f1(gen_text, gold_answer)
                     accum[cond][3] += compute_em(gen_text, gold_answer)
                     accum[cond][4] += 1
+                    if verbose:
+                        sample_gens[cond] = gen_text
                 except torch.cuda.OutOfMemoryError:
                     torch.cuda.empty_cache()
 
@@ -601,8 +608,19 @@ def evaluate(
                 accum["no_prefix"][2] += compute_f1(gen_text, gold_answer)
                 accum["no_prefix"][3] += compute_em(gen_text, gold_answer)
                 accum["no_prefix"][4] += 1
+                if verbose:
+                    sample_gens["no_prefix"] = gen_text
             except torch.cuda.OutOfMemoryError:
                 torch.cuda.empty_cache()
+
+            # Print per-sample generations
+            if verbose and sample_gens:
+                tqdm.write(f"\n--- Sample {idx} ---")
+                tqdm.write(f"  Gold: {gold_answer}")
+                for cond in conditions:
+                    if cond in sample_gens:
+                        f1 = compute_f1(sample_gens[cond], gold_answer)
+                        tqdm.write(f"  {cond:<20s}: {sample_gens[cond]!r}  (F1={f1:.2f})")
 
         # Progress bar
         if accum["full_context"][1] > 0:
