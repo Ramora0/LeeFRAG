@@ -163,10 +163,12 @@ class TwoStageTrainer:
                     # Update progress bar
                     lr = self.optimizer.param_groups[0]["lr"]
                     phase = self.compression_scheduler.get_phase(global_step)
+                    use_hs = self.training_config.hidden_state_loss
+                    secondary_tag = "hs" if use_hs else "kl"
                     pbar.set_postfix(
                         loss=f"{avg_loss:.4f}",
                         ce=f"{avg_ce:.4f}",
-                        kl=f"{avg_kl:.4f}",
+                        **{secondary_tag: f"{avg_kl:.4f}"},
                         lr=f"{lr:.2e}",
                         comp=f"{compression_ratio}x",
                         step=f"{global_step}/{self.total_steps}",
@@ -175,10 +177,14 @@ class TwoStageTrainer:
                     if global_step % self.training_config.logging_steps == 0:
                         if self.use_wandb:
                             import wandb
+                            secondary_key = (
+                                "train/hidden_state_loss" if use_hs
+                                else "train/kl_loss"
+                            )
                             wandb.log({
                                 "train/loss": avg_loss,
                                 "train/ce_loss": avg_ce,
-                                "train/kl_loss": avg_kl,
+                                secondary_key: avg_kl,
                                 "train/lr": lr,
                                 "train/compression_ratio": compression_ratio,
                                 "train/empirical_compression_ratio": avg_empirical_ratio,
@@ -188,24 +194,34 @@ class TwoStageTrainer:
 
                     # Evaluation
                     if global_step % self.training_config.eval_steps == 0:
-                        eval_ce, eval_kl = self.evaluate(compression_ratio)
-                        eval_total = eval_ce + self.training_config.kl_weight * eval_kl
+                        eval_ce, eval_secondary = self.evaluate(compression_ratio)
+                        use_hs = self.training_config.hidden_state_loss
+                        secondary_weight = (
+                            self.training_config.hidden_state_weight if use_hs
+                            else self.training_config.kl_weight
+                        )
+                        eval_total = eval_ce + secondary_weight * eval_secondary
+                        secondary_name = "HS" if use_hs else "KL"
                         tqdm.write(
                             f"Eval @ step {global_step}: "
-                            f"CE={eval_ce:.4f}, KL={eval_kl:.4f}, "
+                            f"CE={eval_ce:.4f}, {secondary_name}={eval_secondary:.4f}, "
                             f"total={eval_total:.4f}, "
                             f"ppl={math.exp(eval_ce):.2f}, "
                             f"compression={compression_ratio}x"
                         )
                         if self.use_wandb:
                             import wandb
-                            wandb.log({
+                            log_dict = {
                                 "eval/ce_loss": eval_ce,
-                                "eval/kl_loss": eval_kl,
                                 "eval/total_loss": eval_total,
                                 "eval/perplexity": math.exp(eval_ce),
                                 "eval/compression_ratio": compression_ratio,
-                            })
+                            }
+                            if use_hs:
+                                log_dict["eval/hidden_state_loss"] = eval_secondary
+                            else:
+                                log_dict["eval/kl_loss"] = eval_secondary
+                            wandb.log(log_dict)
                         self.qformer.train()
 
                     # Save checkpoint
@@ -233,7 +249,7 @@ class TwoStageTrainer:
 
         # === Stage A: Run frozen LLM on [docs | Q+A], extract hidden states + teacher logits ===
         with torch.no_grad():
-            doc_hidden_states, teacher_logits = self._stage_a(
+            doc_hidden_states, teacher_logits, teacher_qa_hidden = self._stage_a(
                 doc_token_ids, doc_lengths, stage_b_input_ids
             )
 
@@ -243,22 +259,41 @@ class TwoStageTrainer:
                 for doc_hs in doc_hidden_states
             ]
             teacher_logits = teacher_logits.to(self.device)
+            if teacher_qa_hidden is not None:
+                teacher_qa_hidden = [h.to(self.device) for h in teacher_qa_hidden]
 
         # === Stage B: Compress hidden states and compute loss ===
         with torch.amp.autocast("cuda", enabled=self.training_config.fp16):
             loss = self._stage_b(
                 doc_hidden_states, compression_ratio,
                 stage_b_input_ids, stage_b_labels, teacher_logits,
+                teacher_qa_hidden,
             )
 
         return loss
+
+    def _get_hidden_state_layer_indices(self) -> list[int]:
+        """Return which layer indices to use for hidden state matching.
+
+        Parses hidden_state_layers config: "all" or "last_N" (e.g. "last_8").
+        Returns indices into hidden_states tuple (1-indexed, skipping embedding).
+        """
+        spec = self.training_config.hidden_state_layers
+        n = self.model_config.num_layers
+        if spec == "all":
+            return list(range(1, n + 1))
+        elif spec.startswith("last_"):
+            k = int(spec.split("_")[1])
+            return list(range(n - k + 1, n + 1))
+        else:
+            raise ValueError(f"Unknown hidden_state_layers spec: {spec}")
 
     def _stage_a(
         self,
         doc_token_ids: list[torch.Tensor],
         doc_lengths: list[int],
         qa_input_ids: torch.Tensor,
-    ) -> tuple[list[list[torch.Tensor]], torch.Tensor]:
+    ) -> tuple[list[list[torch.Tensor]], torch.Tensor, list[torch.Tensor] | None]:
         """Stage A: Run frozen LLM on [docs | Q+A] in one forward pass.
 
         Uses block-diagonal causal mask for docs, with Q+A attending to all docs.
@@ -266,6 +301,8 @@ class TwoStageTrainer:
         Returns:
             per_doc_hidden: Per-document hidden states for Q-Former compression.
             teacher_logits: Logits over Q+A tokens [batch, qa_len, vocab_size].
+            teacher_qa_hidden: Q+A hidden states per layer (if hidden_state_loss),
+                else None. Each shape: [batch, qa_len, hidden_size].
         """
         # Concatenate: [doc0 | doc1 | ... | Q+A]
         doc_concat = torch.cat(doc_token_ids, dim=0).unsqueeze(0).to(self.device)
@@ -296,14 +333,24 @@ class TwoStageTrainer:
         doc_total = sum(doc_lengths)
         teacher_logits = outputs.logits[:, doc_total:, :]
 
+        # Extract teacher Q+A hidden states for hidden state matching
+        teacher_qa_hidden = None
+        if self.training_config.hidden_state_loss:
+            layer_indices = self._get_hidden_state_layer_indices()
+            teacher_qa_hidden = [
+                outputs.hidden_states[i][:, doc_total:, :] for i in layer_indices
+            ]
+
         if self.training_config.offload_stage_a_to_cpu:
             per_doc_hidden = [
                 [hs.cpu() for hs in doc_hs]
                 for doc_hs in per_doc_hidden
             ]
             teacher_logits = teacher_logits.cpu()
+            if teacher_qa_hidden is not None:
+                teacher_qa_hidden = [h.cpu() for h in teacher_qa_hidden]
 
-        return per_doc_hidden, teacher_logits
+        return per_doc_hidden, teacher_logits, teacher_qa_hidden
 
     def _stage_b(
         self,
@@ -312,9 +359,11 @@ class TwoStageTrainer:
         input_ids: torch.Tensor,
         labels: torch.Tensor,
         teacher_logits: torch.Tensor,
+        teacher_qa_hidden: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        """Stage B: Compress hidden states, run LLM, compute CE + KL loss.
+        """Stage B: Compress hidden states, run LLM, compute loss.
 
+        Loss = CE + (hidden_state_matching OR KL), controlled by config.
         Gradients flow through the compressed KV cache back to Q-Former.
         """
         # Compress each document's hidden states into KV caches
@@ -344,10 +393,12 @@ class TwoStageTrainer:
         # No explicit attention_mask: HF generates the correct prefix-causal
         # pattern from past_key_values (full attn to prefix + causal among new
         # tokens). Omitting it lets SDPA use the FlashAttention backend.
+        use_hs_loss = self.training_config.hidden_state_loss
         outputs = self.model(
             input_ids=input_ids,
             past_key_values=compressed_cache,
             use_cache=False,
+            output_hidden_states=use_hs_loss,
         )
 
         student_logits = outputs.logits  # [batch, seq_len, vocab_size]
@@ -362,17 +413,50 @@ class TwoStageTrainer:
             ignore_index=-100,
         )
 
-        # === KL divergence: teacher (full context) vs student (compressed) ===
-        kl_loss = self._compute_kl_loss(teacher_logits, student_logits, labels)
-
-        total_loss = ce_loss + self.training_config.kl_weight * kl_loss
+        if use_hs_loss and teacher_qa_hidden is not None:
+            # === Hidden state matching: teacher (full context) vs student (compressed) ===
+            hs_loss = self._compute_hidden_state_loss(
+                teacher_qa_hidden, outputs.hidden_states
+            )
+            total_loss = ce_loss + self.training_config.hidden_state_weight * hs_loss
+            self._last_kl_loss = hs_loss.item()
+        else:
+            # === KL divergence: teacher (full context) vs student (compressed) ===
+            kl_loss = self._compute_kl_loss(teacher_logits, student_logits, labels)
+            total_loss = ce_loss + self.training_config.kl_weight * kl_loss
+            self._last_kl_loss = kl_loss.item()
 
         # Stash components for logging (detached)
         self._last_ce_loss = ce_loss.item()
-        self._last_kl_loss = kl_loss.item()
         self._last_empirical_ratio = sum(empirical_ratios) / len(empirical_ratios)
 
         return total_loss
+
+    def _compute_hidden_state_loss(
+        self,
+        teacher_qa_hidden: list[torch.Tensor],
+        student_hidden_states: tuple[torch.Tensor, ...],
+    ) -> torch.Tensor:
+        """Compute MSE between teacher and student hidden states at Q+A positions.
+
+        Args:
+            teacher_qa_hidden: List of teacher hidden states at Q+A positions,
+                one per matched layer. Each [batch, qa_len, hidden_size].
+            student_hidden_states: Full tuple of student hidden states from
+                model output (including embedding at index 0).
+
+        Returns:
+            Scalar MSE loss averaged over matched layers.
+        """
+        layer_indices = self._get_hidden_state_layer_indices()
+        total_loss = torch.tensor(0.0, device=teacher_qa_hidden[0].device)
+
+        for i, layer_idx in enumerate(layer_indices):
+            teacher_hs = teacher_qa_hidden[i]
+            student_hs = student_hidden_states[layer_idx]  # [batch, qa_len, hidden_size]
+            total_loss = total_loss + F.mse_loss(student_hs, teacher_hs)
+
+        return total_loss / len(layer_indices)
 
     def _compute_kl_loss(
         self,
@@ -459,7 +543,7 @@ class TwoStageTrainer:
                 continue
 
             # Stage A
-            doc_hidden_states, teacher_logits = self._stage_a(
+            doc_hidden_states, teacher_logits, teacher_qa_hidden = self._stage_a(
                 doc_token_ids, doc_lengths, stage_b_input_ids
             )
             if self.training_config.offload_stage_a_to_cpu:
@@ -468,6 +552,8 @@ class TwoStageTrainer:
                     for doc_hs in doc_hidden_states
                 ]
                 teacher_logits = teacher_logits.to(self.device)
+                if teacher_qa_hidden is not None:
+                    teacher_qa_hidden = [h.to(self.device) for h in teacher_qa_hidden]
 
             with torch.amp.autocast("cuda", enabled=self.training_config.fp16):
                 per_doc_compressed = []
@@ -485,10 +571,12 @@ class TwoStageTrainer:
                     compressed_cache, self.model_config.num_layers, rotary_emb
                 )
 
+                use_hs_loss = self.training_config.hidden_state_loss
                 outputs = self.model(
                     input_ids=stage_b_input_ids,
                     past_key_values=compressed_cache,
                     use_cache=False,
+                    output_hidden_states=use_hs_loss,
                 )
 
                 student_logits = outputs.logits
@@ -500,12 +588,18 @@ class TwoStageTrainer:
                     shift_labels.view(-1),
                     ignore_index=-100,
                 )
-                kl_loss = self._compute_kl_loss(
-                    teacher_logits, student_logits, stage_b_labels
-                )
+
+                if use_hs_loss and teacher_qa_hidden is not None:
+                    secondary_loss = self._compute_hidden_state_loss(
+                        teacher_qa_hidden, outputs.hidden_states
+                    )
+                else:
+                    secondary_loss = self._compute_kl_loss(
+                        teacher_logits, student_logits, stage_b_labels
+                    )
 
             total_ce += ce_loss.item()
-            total_kl += kl_loss.item()
+            total_kl += secondary_loss.item()
             num_batches += 1
             eval_pbar.set_postfix(
                 ce=f"{total_ce / num_batches:.4f}",

@@ -45,6 +45,12 @@ def parse_args():
     parser.add_argument("--offload_stage_a_to_cpu", action="store_true")
     parser.add_argument("--kl_weight", type=float, default=1.0, help="Weight for KL divergence loss")
     parser.add_argument("--kl_top_k", type=int, default=0, help="Top-k logits for KL (0=full vocab)")
+    parser.add_argument("--hidden_state_loss", action="store_true",
+                        help="Use hidden state matching instead of KL divergence")
+    parser.add_argument("--hidden_state_weight", type=float, default=1.0,
+                        help="Weight for hidden state matching loss")
+    parser.add_argument("--hidden_state_layers", type=str, default="all",
+                        help="Which layers to match: 'all' or 'last_N' (e.g. 'last_8')")
     parser.add_argument("--cross_attn_mode", type=str, default="global", choices=["global", "windowed"])
     parser.add_argument("--resume_from", type=str, default=None, help="Path to checkpoint to resume from")
     parser.add_argument("--compression_schedule", type=int, nargs="+", default=[2, 4, 8, 16],
@@ -70,6 +76,9 @@ def main():
         offload_stage_a_to_cpu=args.offload_stage_a_to_cpu,
         kl_weight=args.kl_weight,
         kl_top_k=args.kl_top_k,
+        hidden_state_loss=args.hidden_state_loss,
+        hidden_state_weight=args.hidden_state_weight,
+        hidden_state_layers=args.hidden_state_layers,
         compression_schedule=args.compression_schedule,
     )
 

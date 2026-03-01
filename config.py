@@ -51,5 +51,8 @@ class TrainingConfig:
     use_wandb: bool = True
     kl_weight: float = 1.0  # alpha for KL divergence loss: total = CE + alpha * KL
     kl_top_k: int = 0  # if > 0, compute KL only over top-k teacher logits (memory saving)
+    hidden_state_loss: bool = False  # use hidden state matching instead of KL
+    hidden_state_weight: float = 1.0  # weight for hidden state matching loss
+    hidden_state_layers: str = "all"  # "all" or "last_N" (e.g. "last_8")
     gradient_checkpoint_llm: bool = False
     offload_stage_a_to_cpu: bool = False
