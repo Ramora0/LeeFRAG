@@ -310,48 +310,57 @@ def eval_ce_no_prefix(model, input_ids, labels, device):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
+def greedy_decode(model, input_ids, device, max_new_tokens=64, past_key_values=None):
+    """Manual greedy decode loop using model() forward passes.
+
+    model.generate() breaks with synthetic past_key_values (its internal
+    cache_position tracking assumes it created the cache). This uses the
+    same forward call that works in training and CE eval.
+    """
+    cur_ids = input_ids.to(device)
+    cache = past_key_values
+    generated = []
+
+    for _ in range(max_new_tokens):
+        with torch.amp.autocast("cuda"):
+            outputs = model(
+                input_ids=cur_ids,
+                past_key_values=cache,
+                use_cache=True,
+            )
+        next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        generated.append(next_token)
+        if next_token.item() == model.config.eos_token_id:
+            break
+        cur_ids = next_token
+        cache = outputs.past_key_values
+
+    if generated:
+        return torch.cat(generated, dim=-1)[0]
+    return torch.tensor([], dtype=torch.long, device=device)
+
+
+@torch.no_grad()
 def generate_compressed(model, qformer, doc_hidden_states, compression_ratio,
                         prompt_ids, model_config, device, max_new_tokens=64):
     """Generate with compressed prefix."""
     compressed_cache = compress_docs(
         qformer, doc_hidden_states, compression_ratio, model, model_config,
     )
-    with torch.amp.autocast("cuda"):
-        output_ids = model.generate(
-            input_ids=prompt_ids.to(device),
-            past_key_values=compressed_cache,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-        )
-    # Strip prompt
-    new_tokens = output_ids[0, prompt_ids.shape[1]:]
-    return new_tokens
+    return greedy_decode(model, prompt_ids, device, max_new_tokens,
+                         past_key_values=compressed_cache)
 
 
 @torch.no_grad()
 def generate_full_context(model, full_prompt_ids, device, max_new_tokens=64):
     """Generate with full inline context."""
-    with torch.amp.autocast("cuda"):
-        output_ids = model.generate(
-            input_ids=full_prompt_ids.to(device),
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-        )
-    new_tokens = output_ids[0, full_prompt_ids.shape[1]:]
-    return new_tokens
+    return greedy_decode(model, full_prompt_ids, device, max_new_tokens)
 
 
 @torch.no_grad()
 def generate_no_prefix(model, prompt_ids, device, max_new_tokens=64):
     """Generate with no documents."""
-    with torch.amp.autocast("cuda"):
-        output_ids = model.generate(
-            input_ids=prompt_ids.to(device),
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-        )
-    new_tokens = output_ids[0, prompt_ids.shape[1]:]
-    return new_tokens
+    return greedy_decode(model, prompt_ids, device, max_new_tokens)
 
 
 # ---------------------------------------------------------------------------
