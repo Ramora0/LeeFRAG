@@ -163,7 +163,6 @@ def forward_no_prefix(model, input_ids, labels):
 
 def make_zero_cache(compressed_cache, num_layers):
     """Replace all K/V in the cache with zeros."""
-    from transformers.cache_utils import DynamicCache
     from kv_cache_utils import build_dynamic_cache
 
     pairs = []
@@ -244,13 +243,13 @@ def run_tests(
         if not doc_token_ids or sum(doc_lengths) == 0:
             continue
 
-        # Stage A
-        doc_hidden_states, teacher_logits = run_stage_a(
+        # Stage A (teacher_logits unused here but available for future KL tests)
+        doc_hidden_states, _ = run_stage_a(
             model, doc_token_ids, doc_lengths, stage_b_input_ids, model_config, device
         )
 
         # Compress with trained Q-Former
-        compressed_cache, prefix_len = compress_docs(
+        compressed_cache, _ = compress_docs(
             qformer, doc_hidden_states, compression_ratio, model, model_config
         )
 

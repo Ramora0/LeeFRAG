@@ -1,0 +1,580 @@
+"""HotpotQA benchmark evaluation for Q-Former KV cache compression.
+
+Evaluates a trained checkpoint on HotpotQA (distractor setting):
+- 10 paragraphs per question (2 gold + 8 distractors)
+- Short-answer, multi-hop reasoning
+
+Conditions:
+1. Full context — all docs inline, standard causal attention (ceiling)
+2. Compressed Nx — Q-Former compressed KV prefix at each ratio
+3. No prefix — question only, no documents (floor)
+
+Metrics:
+- CE / PPL — cross-entropy and perplexity on answer tokens (teacher-forced)
+- F1 / EM — generation quality scored against gold answers (SQuAD-style)
+"""
+
+import argparse
+import collections
+import logging
+import math
+import re
+import string
+
+import torch
+import torch.nn.functional as F
+from datasets import load_dataset
+from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from block_attention import build_block_causal_mask_with_qa
+from config import ModelConfig, QFormerConfig
+from kv_cache_utils import (
+    apply_rope_to_cache,
+    concat_compressed_caches,
+    extract_doc_hidden_states,
+)
+from qformer import QFormerKVCompressor
+
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+SYSTEM_PROMPT = "Answer the question based on the provided documents. Give a short, direct answer."
+
+
+# ---------------------------------------------------------------------------
+# SQuAD-style answer normalization and scoring
+# ---------------------------------------------------------------------------
+
+def normalize_answer(s: str) -> str:
+    """Lower text and remove punctuation, articles and extra whitespace."""
+    s = s.lower()
+    # Remove articles
+    s = re.sub(r"\b(a|an|the)\b", " ", s)
+    # Remove punctuation
+    s = s.translate(str.maketrans("", "", string.punctuation))
+    # Collapse whitespace
+    s = " ".join(s.split())
+    return s
+
+
+def compute_f1(prediction: str, ground_truth: str) -> float:
+    pred_tokens = normalize_answer(prediction).split()
+    gt_tokens = normalize_answer(ground_truth).split()
+    if not gt_tokens:
+        return float(not pred_tokens)
+    if not pred_tokens:
+        return 0.0
+    common = collections.Counter(pred_tokens) & collections.Counter(gt_tokens)
+    num_same = sum(common.values())
+    if num_same == 0:
+        return 0.0
+    precision = num_same / len(pred_tokens)
+    recall = num_same / len(gt_tokens)
+    return 2 * precision * recall / (precision + recall)
+
+
+def compute_em(prediction: str, ground_truth: str) -> float:
+    return float(normalize_answer(prediction) == normalize_answer(ground_truth))
+
+
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
+
+def load_hotpotqa(max_samples: int, seed: int = 42):
+    """Load HotpotQA distractor validation set."""
+    ds = load_dataset("hotpot_qa", "distractor", split="validation", trust_remote_code=True)
+    ds = ds.shuffle(seed=seed)
+    if max_samples < len(ds):
+        ds = ds.select(range(max_samples))
+    return ds
+
+
+def format_paragraphs(sample: dict) -> tuple[list[str], str, str]:
+    """Extract documents, question, and answer from a HotpotQA sample.
+
+    Returns:
+        doc_texts: List of paragraph strings (title + sentences).
+        question: The question string.
+        answer: The gold answer string.
+    """
+    titles = sample["context"]["title"]
+    sentences_list = sample["context"]["sentences"]
+
+    doc_texts = []
+    for title, sentences in zip(titles, sentences_list):
+        text = f"{title}: {''.join(sentences)}"
+        doc_texts.append(text)
+
+    return doc_texts, sample["question"], sample["answer"]
+
+
+# ---------------------------------------------------------------------------
+# Tokenization helpers
+# ---------------------------------------------------------------------------
+
+def tokenize_documents(doc_texts, tokenizer, model_config):
+    """Tokenize documents with per-doc and total limits (same as training)."""
+    doc_token_ids = []
+    total_tokens = 0
+    for doc in doc_texts:
+        ids = tokenizer.encode(
+            doc, add_special_tokens=False,
+            max_length=model_config.max_doc_tokens, truncation=True,
+        )
+        if total_tokens + len(ids) > model_config.max_total_doc_tokens:
+            remaining = model_config.max_total_doc_tokens - total_tokens
+            if remaining > 0:
+                ids = ids[:remaining]
+            else:
+                break
+        doc_token_ids.append(torch.tensor(ids, dtype=torch.long))
+        total_tokens += len(ids)
+    return doc_token_ids
+
+
+def build_chat_tokens(tokenizer, system_prompt, user_content, answer=None):
+    """Build chat-templated token ids.
+
+    Returns:
+        input_ids: [1, seq_len]
+        labels: [1, seq_len] with -100 on non-answer tokens (None if no answer)
+        prompt_len: length of prompt portion (for generation)
+    """
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
+    ]
+    prompt_text = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True,
+    )
+    prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
+
+    if answer is not None:
+        answer_ids = tokenizer.encode(answer, add_special_tokens=False,
+                                      max_length=512, truncation=True)
+        full_ids = prompt_ids + answer_ids + [tokenizer.eos_token_id]
+        labels = [-100] * len(prompt_ids) + answer_ids + [tokenizer.eos_token_id]
+        input_ids = torch.tensor([full_ids], dtype=torch.long)
+        labels = torch.tensor([labels], dtype=torch.long)
+        return input_ids, labels, len(prompt_ids)
+    else:
+        input_ids = torch.tensor([prompt_ids], dtype=torch.long)
+        return input_ids, None, len(prompt_ids)
+
+
+# ---------------------------------------------------------------------------
+# Model loading
+# ---------------------------------------------------------------------------
+
+def load_checkpoint(checkpoint_path, device):
+    """Load model, tokenizer, and trained Q-Former from a checkpoint."""
+    model_config = ModelConfig()
+    qformer_config = QFormerConfig()
+
+    tokenizer = AutoTokenizer.from_pretrained(model_config.model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_config.model_name, torch_dtype=torch.float16, device_map="auto",
+    )
+    model.eval()
+
+    qformer = QFormerKVCompressor(qformer_config, model_config).to(device)
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
+
+    state_dict = ckpt["qformer_state_dict"]
+    state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+    qformer.load_state_dict(state_dict)
+    qformer.eval()
+
+    step = ckpt.get("step", -1)
+    ckpt_ratio = ckpt.get("compression_ratio", 4)
+    logger.info(f"Loaded checkpoint from step {step}, compression_ratio={ckpt_ratio}")
+
+    return model, tokenizer, qformer, model_config
+
+
+# ---------------------------------------------------------------------------
+# Stage A: extract per-doc hidden states
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def run_stage_a(model, doc_token_ids, doc_lengths, qa_input_ids, model_config, device):
+    """Run frozen LLM on [docs | Q+A] with block-diagonal mask; extract hidden states."""
+    doc_concat = torch.cat(doc_token_ids, dim=0).unsqueeze(0).to(device)
+    full_input = torch.cat([doc_concat, qa_input_ids], dim=1)
+
+    qa_length = qa_input_ids.shape[1]
+    attn_mask = build_block_causal_mask_with_qa(
+        doc_lengths, qa_length, dtype=torch.float16, device=device,
+    )
+
+    outputs = model(
+        input_ids=full_input, attention_mask=attn_mask,
+        output_hidden_states=True, use_cache=False,
+    )
+
+    per_doc_hidden = extract_doc_hidden_states(
+        outputs.hidden_states, doc_lengths, model_config.num_layers,
+    )
+    return per_doc_hidden
+
+
+# ---------------------------------------------------------------------------
+# Compression
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def compress_docs(qformer, doc_hidden_states, compression_ratio, model, model_config):
+    """Q-Former compress + RoPE. Returns a fresh DynamicCache."""
+    per_doc_compressed = []
+    with torch.amp.autocast("cuda"):
+        for doc_hs in doc_hidden_states:
+            compressed = qformer(doc_hs, compression_ratio)
+            per_doc_compressed.append(compressed)
+
+    compressed_cache = concat_compressed_caches(
+        per_doc_compressed, model_config.num_layers,
+    )
+    rotary_emb = model.model.rotary_emb
+    compressed_cache = apply_rope_to_cache(
+        compressed_cache, model_config.num_layers, rotary_emb,
+    )
+    return compressed_cache
+
+
+# ---------------------------------------------------------------------------
+# CE evaluation
+# ---------------------------------------------------------------------------
+
+def compute_ce_loss(logits, labels):
+    """Compute CE on answer tokens. Returns (loss_sum, n_tokens) or None."""
+    shift_logits = logits[:, :-1, :].contiguous()
+    shift_labels = labels[:, 1:].contiguous()
+
+    loss_per_token = F.cross_entropy(
+        shift_logits.view(-1, shift_logits.size(-1)),
+        shift_labels.view(-1),
+        ignore_index=-100,
+        reduction="none",
+    )
+
+    valid_mask = shift_labels.view(-1) != -100
+    n_valid = valid_mask.sum().item()
+    if n_valid == 0:
+        return None
+    return loss_per_token[valid_mask].sum().item(), n_valid
+
+
+@torch.no_grad()
+def eval_ce_compressed(model, qformer, doc_hidden_states, compression_ratio,
+                       input_ids, labels, model_config, device):
+    """CE eval with compressed prefix."""
+    compressed_cache = compress_docs(
+        qformer, doc_hidden_states, compression_ratio, model, model_config,
+    )
+    with torch.amp.autocast("cuda"):
+        outputs = model(
+            input_ids=input_ids.to(device),
+            past_key_values=compressed_cache,
+            use_cache=False,
+        )
+    return compute_ce_loss(outputs.logits, labels.to(device))
+
+
+@torch.no_grad()
+def eval_ce_full_context(model, full_input_ids, full_labels, device):
+    """CE eval with full inline context (no compression)."""
+    with torch.amp.autocast("cuda"):
+        outputs = model(
+            input_ids=full_input_ids.to(device), use_cache=False,
+        )
+    return compute_ce_loss(outputs.logits, full_labels.to(device))
+
+
+@torch.no_grad()
+def eval_ce_no_prefix(model, input_ids, labels, device):
+    """CE eval with no documents at all."""
+    with torch.amp.autocast("cuda"):
+        outputs = model(input_ids=input_ids.to(device), use_cache=False)
+    return compute_ce_loss(outputs.logits, labels.to(device))
+
+
+# ---------------------------------------------------------------------------
+# Generation evaluation
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def generate_compressed(model, qformer, doc_hidden_states, compression_ratio,
+                        prompt_ids, model_config, device, max_new_tokens=64):
+    """Generate with compressed prefix."""
+    compressed_cache = compress_docs(
+        qformer, doc_hidden_states, compression_ratio, model, model_config,
+    )
+    with torch.amp.autocast("cuda"):
+        output_ids = model.generate(
+            input_ids=prompt_ids.to(device),
+            past_key_values=compressed_cache,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+        )
+    # Strip prompt
+    new_tokens = output_ids[0, prompt_ids.shape[1]:]
+    return new_tokens
+
+
+@torch.no_grad()
+def generate_full_context(model, full_prompt_ids, device, max_new_tokens=64):
+    """Generate with full inline context."""
+    with torch.amp.autocast("cuda"):
+        output_ids = model.generate(
+            input_ids=full_prompt_ids.to(device),
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+        )
+    new_tokens = output_ids[0, full_prompt_ids.shape[1]:]
+    return new_tokens
+
+
+@torch.no_grad()
+def generate_no_prefix(model, prompt_ids, device, max_new_tokens=64):
+    """Generate with no documents."""
+    with torch.amp.autocast("cuda"):
+        output_ids = model.generate(
+            input_ids=prompt_ids.to(device),
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+        )
+    new_tokens = output_ids[0, prompt_ids.shape[1]:]
+    return new_tokens
+
+
+# ---------------------------------------------------------------------------
+# Main evaluation loop
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def evaluate(
+    checkpoint_path: str,
+    compression_ratios: list[int],
+    max_samples: int = 500,
+    ce_only: bool = False,
+    seed: int = 42,
+):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model, tokenizer, qformer, model_config = load_checkpoint(checkpoint_path, device)
+
+    logger.info("Loading HotpotQA distractor validation set...")
+    dataset = load_hotpotqa(max_samples, seed=seed)
+    logger.info(f"Evaluating on {len(dataset)} samples")
+
+    # Condition names: full_context, compressed_Nx (per ratio), no_prefix
+    conditions = ["full_context"] + [f"compressed_{r}x" for r in compression_ratios] + ["no_prefix"]
+
+    # Accumulators: {condition: [ce_sum, n_tokens, f1_sum, em_sum, gen_count]}
+    accum = {c: [0.0, 0, 0.0, 0.0, 0] for c in conditions}
+
+    pbar = tqdm(range(len(dataset)), desc="HotpotQA eval")
+    skipped = 0
+
+    for idx in pbar:
+        sample = dataset[idx]
+        try:
+            doc_texts, question, gold_answer = format_paragraphs(sample)
+        except (KeyError, IndexError):
+            skipped += 1
+            continue
+
+        # Tokenize documents
+        doc_token_ids = tokenize_documents(doc_texts, tokenizer, model_config)
+        if not doc_token_ids:
+            skipped += 1
+            continue
+        doc_lengths = [t.shape[0] for t in doc_token_ids]
+
+        # --- Build token sequences ---
+        # Compressed / no-prefix: question only in user message
+        user_msg_compressed = f"Question: {question}"
+        comp_ids, comp_labels, comp_prompt_len = build_chat_tokens(
+            tokenizer, SYSTEM_PROMPT, user_msg_compressed, answer=gold_answer,
+        )
+        # Prompt-only version for generation
+        comp_prompt_ids, _, _ = build_chat_tokens(
+            tokenizer, SYSTEM_PROMPT, user_msg_compressed, answer=None,
+        )
+
+        # Full context: docs + question in user message
+        docs_text = "\n\n".join(doc_texts)
+        user_msg_full = f"{docs_text}\n\nQuestion: {question}"
+        full_ids, full_labels, full_prompt_len = build_chat_tokens(
+            tokenizer, SYSTEM_PROMPT, user_msg_full, answer=gold_answer,
+        )
+        full_prompt_ids, _, _ = build_chat_tokens(
+            tokenizer, SYSTEM_PROMPT, user_msg_full, answer=None,
+        )
+
+        # --- Stage A (once per sample) ---
+        try:
+            # Use compressed prompt for Stage A (Q-Former needs qa_input_ids)
+            per_doc_hidden = run_stage_a(
+                model, doc_token_ids, doc_lengths,
+                comp_ids.to(device), model_config, device,
+            )
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            skipped += 1
+            continue
+
+        # === Full context CE ===
+        try:
+            result = eval_ce_full_context(model, full_ids, full_labels, device)
+            if result:
+                accum["full_context"][0] += result[0]
+                accum["full_context"][1] += result[1]
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+
+        # === Compressed CE (per ratio) ===
+        for ratio in compression_ratios:
+            cond = f"compressed_{ratio}x"
+            try:
+                result = eval_ce_compressed(
+                    model, qformer, per_doc_hidden, ratio,
+                    comp_ids, comp_labels, model_config, device,
+                )
+                if result:
+                    accum[cond][0] += result[0]
+                    accum[cond][1] += result[1]
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+
+        # === No prefix CE ===
+        try:
+            result = eval_ce_no_prefix(model, comp_ids, comp_labels, device)
+            if result:
+                accum["no_prefix"][0] += result[0]
+                accum["no_prefix"][1] += result[1]
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+
+        # === Generation (F1 / EM) ===
+        if not ce_only:
+            # Full context generation
+            try:
+                gen_tokens = generate_full_context(model, full_prompt_ids, device)
+                gen_text = tokenizer.decode(gen_tokens, skip_special_tokens=True)
+                accum["full_context"][2] += compute_f1(gen_text, gold_answer)
+                accum["full_context"][3] += compute_em(gen_text, gold_answer)
+                accum["full_context"][4] += 1
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+
+            # Compressed generation (per ratio)
+            for ratio in compression_ratios:
+                cond = f"compressed_{ratio}x"
+                try:
+                    gen_tokens = generate_compressed(
+                        model, qformer, per_doc_hidden, ratio,
+                        comp_prompt_ids, model_config, device,
+                    )
+                    gen_text = tokenizer.decode(gen_tokens, skip_special_tokens=True)
+                    accum[cond][2] += compute_f1(gen_text, gold_answer)
+                    accum[cond][3] += compute_em(gen_text, gold_answer)
+                    accum[cond][4] += 1
+                except torch.cuda.OutOfMemoryError:
+                    torch.cuda.empty_cache()
+
+            # No prefix generation
+            try:
+                gen_tokens = generate_no_prefix(model, comp_prompt_ids, device)
+                gen_text = tokenizer.decode(gen_tokens, skip_special_tokens=True)
+                accum["no_prefix"][2] += compute_f1(gen_text, gold_answer)
+                accum["no_prefix"][3] += compute_em(gen_text, gold_answer)
+                accum["no_prefix"][4] += 1
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+
+        # Progress bar
+        if accum["full_context"][1] > 0:
+            fc_ce = accum["full_context"][0] / accum["full_context"][1]
+            np_ce = accum["no_prefix"][0] / max(accum["no_prefix"][1], 1)
+            postfix = {"full": f"{fc_ce:.3f}", "none": f"{np_ce:.3f}"}
+            for ratio in compression_ratios[:2]:
+                cond = f"compressed_{ratio}x"
+                if accum[cond][1] > 0:
+                    postfix[f"{ratio}x"] = f"{accum[cond][0] / accum[cond][1]:.3f}"
+            pbar.set_postfix(postfix)
+
+    # === Print results ===
+    print()
+    print("=" * 80)
+    print(f"HOTPOTQA EVALUATION  (n={len(dataset)}, skipped={skipped})")
+    print("=" * 80)
+
+    header = f"{'Condition':<22s} {'CE':>7s} {'PPL':>8s}"
+    if not ce_only:
+        header += f" {'F1':>7s} {'EM':>7s} {'n_gen':>6s}"
+    print(header)
+    print("-" * len(header))
+
+    for cond in conditions:
+        ce_sum, n_tok, f1_sum, em_sum, gen_count = accum[cond]
+        if n_tok == 0:
+            print(f"  {cond:<20s}  {'--':>7s} {'--':>8s}")
+            continue
+        ce = ce_sum / n_tok
+        ppl = math.exp(min(ce, 20))  # cap to avoid overflow
+        line = f"  {cond:<20s} {ce:>7.4f} {ppl:>8.2f}"
+        if not ce_only:
+            if gen_count > 0:
+                f1 = f1_sum / gen_count
+                em = em_sum / gen_count
+                line += f" {f1:>7.4f} {em:>7.4f} {gen_count:>6d}"
+            else:
+                line += f" {'--':>7s} {'--':>7s} {'0':>6s}"
+        print(line)
+
+    print("=" * 80)
+    print()
+
+    return {cond: accum[cond] for cond in conditions}
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="HotpotQA benchmark evaluation for Q-Former compression",
+    )
+    parser.add_argument(
+        "checkpoint", type=str,
+        help="Path to checkpoint (e.g., outputs/checkpoint-500/checkpoint.pt)",
+    )
+    parser.add_argument(
+        "--compression_ratios", type=int, nargs="+", default=[4, 8, 16, 32],
+        help="Compression ratios to evaluate (default: 4 8 16 32)",
+    )
+    parser.add_argument(
+        "--max_samples", type=int, default=500,
+        help="Max number of HotpotQA samples (default: 500)",
+    )
+    parser.add_argument(
+        "--ce_only", action="store_true",
+        help="Skip generation eval (F1/EM), only compute CE/PPL",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="Random seed for dataset shuffling (default: 42)",
+    )
+    args = parser.parse_args()
+
+    evaluate(
+        checkpoint_path=args.checkpoint,
+        compression_ratios=args.compression_ratios,
+        max_samples=args.max_samples,
+        ce_only=args.ce_only,
+        seed=args.seed,
+    )
