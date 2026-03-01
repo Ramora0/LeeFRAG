@@ -105,9 +105,10 @@ def run_stage_a(model, doc_token_ids, doc_lengths, qa_input_ids, model_config, d
 def compress_docs(qformer, doc_hidden_states, compression_ratio, model, model_config):
     """Run Q-Former compression and apply RoPE. Returns (cache, prefix_len)."""
     per_doc_compressed = []
-    for doc_hs in doc_hidden_states:
-        compressed = qformer(doc_hs, compression_ratio)
-        per_doc_compressed.append(compressed)
+    with torch.amp.autocast("cuda"):
+        for doc_hs in doc_hidden_states:
+            compressed = qformer(doc_hs, compression_ratio)
+            per_doc_compressed.append(compressed)
 
     compressed_cache = concat_compressed_caches(
         per_doc_compressed, model_config.num_layers
