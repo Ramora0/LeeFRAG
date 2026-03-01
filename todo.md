@@ -3,7 +3,7 @@
 - [ ] Queries based on inputs
 - [ ] Keep queries across layers?
 - [ ] Try a channel bottleneck for fun
-- [ ] Block attention model
+- [.] Block attention model
 
 
 Baseline:

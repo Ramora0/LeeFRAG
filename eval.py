@@ -172,10 +172,9 @@ def build_chat_tokens(tokenizer, system_prompt, user_content, answer=None):
 # Model loading
 # ---------------------------------------------------------------------------
 
-def load_checkpoint(checkpoint_path, device):
-    """Load model, tokenizer, and trained Q-Former from a checkpoint."""
+def load_model(device):
+    """Load frozen model and tokenizer (no Q-Former)."""
     model_config = ModelConfig()
-    qformer_config = QFormerConfig()
 
     tokenizer = AutoTokenizer.from_pretrained(model_config.model_name)
     if tokenizer.pad_token is None:
@@ -185,6 +184,14 @@ def load_checkpoint(checkpoint_path, device):
         model_config.model_name, torch_dtype=torch.float16, device_map="auto",
     )
     model.eval()
+
+    return model, tokenizer, model_config
+
+
+def load_checkpoint(checkpoint_path, device):
+    """Load model, tokenizer, and trained Q-Former from a checkpoint."""
+    model, tokenizer, model_config = load_model(device)
+    qformer_config = QFormerConfig()
 
     qformer = QFormerKVCompressor(qformer_config, model_config).to(device)
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
@@ -462,7 +469,7 @@ def prep_rag_v1_sample(item, collator, tokenizer, model_config):
 
 @torch.no_grad()
 def evaluate(
-    checkpoint_path: str,
+    checkpoint_path: str | None,
     compression_ratios: list[int],
     dataset_name: str = "hotpotqa",
     max_samples: int = 500,
@@ -470,7 +477,13 @@ def evaluate(
     seed: int = 42,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model, tokenizer, qformer, model_config = load_checkpoint(checkpoint_path, device)
+    if checkpoint_path is not None:
+        model, tokenizer, qformer, model_config = load_checkpoint(checkpoint_path, device)
+    else:
+        model, tokenizer, model_config = load_model(device)
+        qformer = None
+        compression_ratios = []
+        logger.info("No checkpoint — running full_context and no_prefix only")
 
     # Load dataset
     if dataset_name == "hotpotqa":
@@ -525,16 +538,18 @@ def evaluate(
         full_prompt_ids = s["full_prompt_ids"]
         gold_answer = s["gold_answer"]
 
-        # --- Stage A (once per sample) ---
-        try:
-            per_doc_hidden = run_stage_a(
-                model, doc_token_ids, doc_lengths,
-                comp_ids.to(device), model_config, device,
-            )
-        except torch.cuda.OutOfMemoryError:
-            torch.cuda.empty_cache()
-            skipped += 1
-            continue
+        # --- Stage A (once per sample, only if Q-Former is loaded) ---
+        per_doc_hidden = None
+        if qformer is not None:
+            try:
+                per_doc_hidden = run_stage_a(
+                    model, doc_token_ids, doc_lengths,
+                    comp_ids.to(device), model_config, device,
+                )
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                skipped += 1
+                continue
 
         # === Full context CE ===
         try:
@@ -584,22 +599,23 @@ def evaluate(
             except torch.cuda.OutOfMemoryError:
                 torch.cuda.empty_cache()
 
-            # Compressed generation (per ratio)
-            for ratio in compression_ratios:
-                cond = f"compressed_{ratio}x"
-                try:
-                    gen_tokens = generate_compressed(
-                        model, qformer, per_doc_hidden, ratio,
-                        comp_prompt_ids, model_config, device,
-                    )
-                    gen_text = tokenizer.decode(gen_tokens, skip_special_tokens=True)
-                    accum[cond][2] += compute_f1(gen_text, gold_answer)
-                    accum[cond][3] += compute_em(gen_text, gold_answer)
-                    accum[cond][4] += 1
-                    if verbose:
-                        sample_gens[cond] = gen_text
-                except torch.cuda.OutOfMemoryError:
-                    torch.cuda.empty_cache()
+            # Compressed generation (per ratio, only if Q-Former loaded)
+            if qformer is not None:
+                for ratio in compression_ratios:
+                    cond = f"compressed_{ratio}x"
+                    try:
+                        gen_tokens = generate_compressed(
+                            model, qformer, per_doc_hidden, ratio,
+                            comp_prompt_ids, model_config, device,
+                        )
+                        gen_text = tokenizer.decode(gen_tokens, skip_special_tokens=True)
+                        accum[cond][2] += compute_f1(gen_text, gold_answer)
+                        accum[cond][3] += compute_em(gen_text, gold_answer)
+                        accum[cond][4] += 1
+                        if verbose:
+                            sample_gens[cond] = gen_text
+                    except torch.cuda.OutOfMemoryError:
+                        torch.cuda.empty_cache()
 
             # No prefix generation
             try:
@@ -673,8 +689,9 @@ if __name__ == "__main__":
         description="Benchmark evaluation for Q-Former compression",
     )
     parser.add_argument(
-        "checkpoint", type=str,
-        help="Path to checkpoint (e.g., outputs/checkpoint-500/checkpoint.pt)",
+        "checkpoint", type=str, nargs="?", default=None,
+        help="Path to checkpoint (e.g., outputs/checkpoint-500/checkpoint.pt). "
+             "Omit to run full_context + no_prefix only (no compression).",
     )
     parser.add_argument(
         "--dataset", type=str, default="hotpotqa", choices=["hotpotqa", "rag_v1"],
