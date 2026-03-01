@@ -1,8 +1,8 @@
-"""HotpotQA benchmark evaluation for Q-Former KV cache compression.
+"""Benchmark evaluation for Q-Former KV cache compression.
 
-Evaluates a trained checkpoint on HotpotQA (distractor setting):
-- 10 paragraphs per question (2 gold + 8 distractors)
-- Short-answer, multi-hop reasoning
+Supports two datasets:
+- hotpotqa: HotpotQA distractor (10 paragraphs, multi-hop, short-answer)
+- rag_v1: RAG-v1 eval split (same data pipeline as test.py, for sanity checks)
 
 Conditions:
 1. Full context — all docs inline, standard causal attention (ceiling)
@@ -28,7 +28,9 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from block_attention import build_block_causal_mask_with_qa
-from config import ModelConfig, QFormerConfig
+from collator import RAGCollator
+from config import ModelConfig, QFormerConfig, TrainingConfig
+from dataset import RAGDataset
 from kv_cache_utils import (
     apply_rope_to_cache,
     concat_compressed_caches,
@@ -364,6 +366,97 @@ def generate_no_prefix(model, prompt_ids, device, max_new_tokens=64):
 
 
 # ---------------------------------------------------------------------------
+# Per-sample data prep (unified across datasets)
+# ---------------------------------------------------------------------------
+
+def prep_hotpotqa_sample(sample, tokenizer, model_config):
+    """Prepare a HotpotQA sample. Returns dict or None on failure."""
+    try:
+        doc_texts, question, gold_answer = format_paragraphs(sample)
+    except (KeyError, IndexError):
+        return None
+
+    doc_token_ids = tokenize_documents(doc_texts, tokenizer, model_config)
+    if not doc_token_ids:
+        return None
+
+    # Compressed / no-prefix: question only in user message
+    user_msg_compressed = f"Question: {question}"
+    comp_ids, comp_labels, _ = build_chat_tokens(
+        tokenizer, SYSTEM_PROMPT, user_msg_compressed, answer=gold_answer,
+    )
+    comp_prompt_ids, _, _ = build_chat_tokens(
+        tokenizer, SYSTEM_PROMPT, user_msg_compressed, answer=None,
+    )
+
+    # Full context: docs + question in user message
+    docs_text = "\n\n".join(doc_texts)
+    user_msg_full = f"{docs_text}\n\nQuestion: {question}"
+    full_ids, full_labels, _ = build_chat_tokens(
+        tokenizer, SYSTEM_PROMPT, user_msg_full, answer=gold_answer,
+    )
+    full_prompt_ids, _, _ = build_chat_tokens(
+        tokenizer, SYSTEM_PROMPT, user_msg_full, answer=None,
+    )
+
+    return {
+        "doc_token_ids": doc_token_ids,
+        "doc_lengths": [t.shape[0] for t in doc_token_ids],
+        "comp_ids": comp_ids,
+        "comp_labels": comp_labels,
+        "comp_prompt_ids": comp_prompt_ids,
+        "full_ids": full_ids,
+        "full_labels": full_labels,
+        "full_prompt_ids": full_prompt_ids,
+        "gold_answer": gold_answer,
+    }
+
+
+def prep_rag_v1_sample(item, collator, tokenizer, model_config):
+    """Prepare a RAG-v1 sample using the training collator (matches test.py exactly)."""
+    batch = collator([item])
+
+    doc_token_ids = batch["doc_token_ids"]
+    if not doc_token_ids or sum(batch["doc_lengths"]) == 0:
+        return None
+
+    # comp_ids / comp_labels from collator — identical to test.py
+    comp_ids = batch["stage_b_input_ids"]
+    comp_labels = batch["stage_b_labels"]
+
+    # Prompt-only for generation: strip answer tokens from stage_b
+    answer_start = batch["answer_start"]
+    comp_prompt_ids = comp_ids[:, :answer_start]
+
+    # Full context: docs inline + question in user message
+    doc_texts = item["doc_texts"]
+    docs_text = "\n\n".join(doc_texts)
+    system_prompt = item["system_prompt"]
+    question_suffix = item["question_suffix"]
+    user_msg_full = f"{docs_text}\n\n{question_suffix}"
+    gold_answer = item["answer"]
+
+    full_ids, full_labels, _ = build_chat_tokens(
+        tokenizer, system_prompt, user_msg_full, answer=gold_answer,
+    )
+    full_prompt_ids, _, _ = build_chat_tokens(
+        tokenizer, system_prompt, user_msg_full, answer=None,
+    )
+
+    return {
+        "doc_token_ids": doc_token_ids,
+        "doc_lengths": batch["doc_lengths"],
+        "comp_ids": comp_ids,
+        "comp_labels": comp_labels,
+        "comp_prompt_ids": comp_prompt_ids,
+        "full_ids": full_ids,
+        "full_labels": full_labels,
+        "full_prompt_ids": full_prompt_ids,
+        "gold_answer": gold_answer,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Main evaluation loop
 # ---------------------------------------------------------------------------
 
@@ -371,6 +464,7 @@ def generate_no_prefix(model, prompt_ids, device, max_new_tokens=64):
 def evaluate(
     checkpoint_path: str,
     compression_ratios: list[int],
+    dataset_name: str = "hotpotqa",
     max_samples: int = 500,
     ce_only: bool = False,
     seed: int = 42,
@@ -378,9 +472,27 @@ def evaluate(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, tokenizer, qformer, model_config = load_checkpoint(checkpoint_path, device)
 
-    logger.info("Loading HotpotQA distractor validation set...")
-    dataset = load_hotpotqa(max_samples, seed=seed)
-    logger.info(f"Evaluating on {len(dataset)} samples")
+    # Load dataset
+    if dataset_name == "hotpotqa":
+        logger.info("Loading HotpotQA distractor validation set...")
+        raw_dataset = load_hotpotqa(max_samples, seed=seed)
+        collator = None
+    elif dataset_name == "rag_v1":
+        logger.info("Loading RAG-v1 eval split (same as test.py)...")
+        training_config = TrainingConfig()
+        raw_dataset = RAGDataset(
+            tokenizer=tokenizer,
+            model_config=model_config,
+            split="eval",
+            eval_split_ratio=training_config.eval_split_ratio,
+            seed=training_config.seed,
+        )
+        collator = RAGCollator(tokenizer)
+    else:
+        raise ValueError(f"Unknown dataset: {dataset_name}")
+
+    n_samples = min(len(raw_dataset), max_samples)
+    logger.info(f"Evaluating on {n_samples} samples from {dataset_name}")
 
     # Condition names: full_context, compressed_Nx (per ratio), no_prefix
     conditions = ["full_context"] + [f"compressed_{r}x" for r in compression_ratios] + ["no_prefix"]
@@ -388,48 +500,32 @@ def evaluate(
     # Accumulators: {condition: [ce_sum, n_tokens, f1_sum, em_sum, gen_count]}
     accum = {c: [0.0, 0, 0.0, 0.0, 0] for c in conditions}
 
-    pbar = tqdm(range(len(dataset)), desc="HotpotQA eval")
+    pbar = tqdm(range(n_samples), desc=f"{dataset_name} eval")
     skipped = 0
 
     for idx in pbar:
-        sample = dataset[idx]
-        try:
-            doc_texts, question, gold_answer = format_paragraphs(sample)
-        except (KeyError, IndexError):
+        # Prep sample (dataset-specific)
+        if dataset_name == "hotpotqa":
+            s = prep_hotpotqa_sample(raw_dataset[idx], tokenizer, model_config)
+        else:
+            s = prep_rag_v1_sample(raw_dataset[idx], collator, tokenizer, model_config)
+
+        if s is None:
             skipped += 1
             continue
 
-        # Tokenize documents
-        doc_token_ids = tokenize_documents(doc_texts, tokenizer, model_config)
-        if not doc_token_ids:
-            skipped += 1
-            continue
-        doc_lengths = [t.shape[0] for t in doc_token_ids]
-
-        # --- Build token sequences ---
-        # Compressed / no-prefix: question only in user message
-        user_msg_compressed = f"Question: {question}"
-        comp_ids, comp_labels, comp_prompt_len = build_chat_tokens(
-            tokenizer, SYSTEM_PROMPT, user_msg_compressed, answer=gold_answer,
-        )
-        # Prompt-only version for generation
-        comp_prompt_ids, _, _ = build_chat_tokens(
-            tokenizer, SYSTEM_PROMPT, user_msg_compressed, answer=None,
-        )
-
-        # Full context: docs + question in user message
-        docs_text = "\n\n".join(doc_texts)
-        user_msg_full = f"{docs_text}\n\nQuestion: {question}"
-        full_ids, full_labels, full_prompt_len = build_chat_tokens(
-            tokenizer, SYSTEM_PROMPT, user_msg_full, answer=gold_answer,
-        )
-        full_prompt_ids, _, _ = build_chat_tokens(
-            tokenizer, SYSTEM_PROMPT, user_msg_full, answer=None,
-        )
+        doc_token_ids = s["doc_token_ids"]
+        doc_lengths = s["doc_lengths"]
+        comp_ids = s["comp_ids"]
+        comp_labels = s["comp_labels"]
+        comp_prompt_ids = s["comp_prompt_ids"]
+        full_ids = s["full_ids"]
+        full_labels = s["full_labels"]
+        full_prompt_ids = s["full_prompt_ids"]
+        gold_answer = s["gold_answer"]
 
         # --- Stage A (once per sample) ---
         try:
-            # Use compressed prompt for Stage A (Q-Former needs qa_input_ids)
             per_doc_hidden = run_stage_a(
                 model, doc_token_ids, doc_lengths,
                 comp_ids.to(device), model_config, device,
@@ -522,7 +618,7 @@ def evaluate(
     # === Print results ===
     print()
     print("=" * 80)
-    print(f"HOTPOTQA EVALUATION  (n={len(dataset)}, skipped={skipped})")
+    print(f"EVALUATION [{dataset_name.upper()}]  (n={n_samples}, skipped={skipped})")
     print("=" * 80)
 
     header = f"{'Condition':<22s} {'CE':>7s} {'PPL':>8s}"
@@ -556,11 +652,16 @@ def evaluate(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="HotpotQA benchmark evaluation for Q-Former compression",
+        description="Benchmark evaluation for Q-Former compression",
     )
     parser.add_argument(
         "checkpoint", type=str,
         help="Path to checkpoint (e.g., outputs/checkpoint-500/checkpoint.pt)",
+    )
+    parser.add_argument(
+        "--dataset", type=str, default="hotpotqa", choices=["hotpotqa", "rag_v1"],
+        help="Dataset to evaluate on (default: hotpotqa). "
+             "Use rag_v1 to sanity-check against test.py numbers.",
     )
     parser.add_argument(
         "--compression_ratios", type=int, nargs="+", default=[4, 8, 16, 32],
@@ -568,7 +669,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--max_samples", type=int, default=500,
-        help="Max number of HotpotQA samples (default: 500)",
+        help="Max samples to evaluate (default: 500)",
     )
     parser.add_argument(
         "--ce_only", action="store_true",
@@ -583,6 +684,7 @@ if __name__ == "__main__":
     evaluate(
         checkpoint_path=args.checkpoint,
         compression_ratios=args.compression_ratios,
+        dataset_name=args.dataset,
         max_samples=args.max_samples,
         ce_only=args.ce_only,
         seed=args.seed,
