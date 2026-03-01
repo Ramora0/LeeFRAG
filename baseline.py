@@ -128,17 +128,18 @@ def eval_loop(name, dataset, model, tokenizer, device, forward_fn, cache_name=No
 def build_baseline_input(
     item: dict, tokenizer, max_total_tokens: int = 4096
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """Build full input with documents inlined in the user message.
+    """Build full input with documents in the system message.
 
-    This is the standard RAG inference format:
-    system + user(docs + answer_mode + question) + assistant(answer)
+    Format matches block attention layout:
+    system(system_prompt + docs) + user(question) + assistant(answer)
     """
     doc_texts = item["doc_texts"]
     full_docs = "\n\n".join(doc_texts)
-    user_content = full_docs + item["question_suffix"]
+    system_with_docs = f"{item['system_prompt']}\n\n{full_docs}"
+    user_content = item["question_suffix"]
 
     messages = [
-        {"role": "system", "content": item["system_prompt"]},
+        {"role": "system", "content": system_with_docs},
         {"role": "user", "content": user_content},
     ]
 
@@ -186,33 +187,38 @@ def forward_full_causal(model, item, tokenizer, device):
 
 
 def forward_block_attention(model, item, tokenizer, device):
-    """Block attention for docs, Q+A attends to all docs + causal within itself."""
+    """Block attention for docs, Q+A attends to all blocks + causal within itself."""
     doc_token_ids = item["doc_token_ids"]
     doc_lengths = [t.shape[0] for t in doc_token_ids]
 
     if not doc_token_ids or sum(doc_lengths) == 0:
         return None
 
-    # Build Q+A tokens using the collator logic
+    # Build Q+A tokens and preamble using the collator logic
     collator = _get_collator(tokenizer)
     stage_b_ids, answer_start, answer_end = collator._build_stage_b_tokens(item)
+    preamble_ids = item["preamble_ids"]
 
-    # Concatenate: [doc0 | doc1 | ... | Q+A]
+    # Block lengths: preamble merges with first doc
+    preamble_len = preamble_ids.shape[0]
+    block_lengths = [preamble_len + doc_lengths[0]] + doc_lengths[1:]
+
+    # Concatenate: [preamble | doc0 | doc1 | ... | Q+A]
     doc_concat = torch.cat(doc_token_ids, dim=0)
-    full_input = torch.cat([doc_concat, stage_b_ids], dim=0).unsqueeze(0).to(device)
+    full_input = torch.cat([preamble_ids, doc_concat, stage_b_ids], dim=0).unsqueeze(0).to(device)
 
     qa_length = stage_b_ids.shape[0]
 
-    # Block-diagonal for docs, Q+A attends to all docs + causal
+    # Block-diagonal for blocks, Q+A attends to all blocks + causal
     attn_mask = build_block_causal_mask_with_qa(
-        doc_lengths, qa_length, dtype=torch.float16, device=device
+        block_lengths, qa_length, dtype=torch.float16, device=device
     )
 
-    # Labels: -100 for everything except answer tokens (offset by doc length)
-    doc_total = sum(doc_lengths)
+    # Labels: -100 for everything except answer tokens (offset by block total)
+    block_total = sum(block_lengths)
     full_labels = torch.full((full_input.shape[1],), -100, dtype=torch.long, device=device)
-    full_labels[doc_total + answer_start : doc_total + answer_end] = (
-        full_input[0, doc_total + answer_start : doc_total + answer_end]
+    full_labels[block_total + answer_start : block_total + answer_end] = (
+        full_input[0, block_total + answer_start : block_total + answer_end]
     )
     full_labels = full_labels.unsqueeze(0)
 
@@ -263,42 +269,48 @@ def forward_mean_pool(model, item, tokenizer, device, compression_ratio):
     if not doc_token_ids or sum(doc_lengths) == 0:
         return None
 
-    # Build Q+A tokens
+    # Build Q+A tokens and preamble
     collator = _get_collator(tokenizer)
     stage_b_ids, answer_start, answer_end = collator._build_stage_b_tokens(item)
+    preamble_ids = item["preamble_ids"]
 
-    # --- Run docs through model with block attention to get KV caches ---
-    doc_concat = torch.cat(doc_token_ids, dim=0).unsqueeze(0).to(device)
+    # Block lengths: preamble merges with first doc
+    preamble_len = preamble_ids.shape[0]
+    block_lengths = [preamble_len + doc_lengths[0]] + doc_lengths[1:]
+
+    # --- Run preamble+docs through model with block attention to get KV caches ---
+    doc_concat = torch.cat(doc_token_ids, dim=0)
+    block_input = torch.cat([preamble_ids, doc_concat], dim=0).unsqueeze(0).to(device)
     doc_attn_mask = build_block_causal_mask(
-        doc_lengths, dtype=torch.float16, device=device
+        block_lengths, dtype=torch.float16, device=device
     )
 
     with torch.amp.autocast("cuda"):
         doc_outputs = model(
-            input_ids=doc_concat,
+            input_ids=block_input,
             attention_mask=doc_attn_mask,
             use_cache=True,
         )
 
-    full_kv = doc_outputs.past_key_values  # DynamicCache with all doc tokens
+    full_kv = doc_outputs.past_key_values  # DynamicCache with all block tokens
     num_layers = len(full_kv.key_cache)
 
-    # --- Slice per-doc and mean-pool ---
+    # --- Slice per-block and mean-pool ---
     pooled_kv_pairs = []  # per layer: (k_concat, v_concat)
     for layer_idx in range(num_layers):
-        full_k = full_kv.key_cache[layer_idx]  # [1, heads, total_doc_len, dim]
+        full_k = full_kv.key_cache[layer_idx]  # [1, heads, total_block_len, dim]
         full_v = full_kv.value_cache[layer_idx]
 
         doc_k_parts = []
         doc_v_parts = []
         offset = 0
-        for doc_len in doc_lengths:
-            k_slice = full_k[:, :, offset:offset + doc_len, :]
-            v_slice = full_v[:, :, offset:offset + doc_len, :]
+        for bl in block_lengths:
+            k_slice = full_k[:, :, offset:offset + bl, :]
+            v_slice = full_v[:, :, offset:offset + bl, :]
             k_pooled, v_pooled = _mean_pool_kv(k_slice, v_slice, compression_ratio)
             doc_k_parts.append(k_pooled)
             doc_v_parts.append(v_pooled)
-            offset += doc_len
+            offset += bl
 
         # Concatenate all docs for this layer
         pooled_kv_pairs.append((

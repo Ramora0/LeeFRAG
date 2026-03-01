@@ -94,17 +94,22 @@ def format_as_rag_v1(sample, tokenizer, model_config):
         max_length=model_config.max_answer_tokens, truncation=True,
     )
 
+    # Build preamble: <|system|>\n{system_prompt}\n\n
+    preamble_text = f"<|system|>\n{RAG_V1_SYSTEM_PROMPT}\n\n"
+    preamble_ids = tokenizer.encode(preamble_text, add_special_tokens=False)
+
+    # Build QA suffix: <|user|>\n{question_suffix}\n<|assistant|>\n
+    qa_suffix_text = f"<|user|>\n{question_suffix}\n<|assistant|>\n"
+    qa_suffix_ids = tokenizer.encode(qa_suffix_text, add_special_tokens=False)
+
     # Return dict matching RAGDataset.__getitem__ output
     return {
         "doc_texts": doc_texts,
         "doc_token_ids": doc_token_ids,
+        "preamble_ids": torch.tensor(preamble_ids, dtype=torch.long),
+        "qa_suffix_ids": torch.tensor(qa_suffix_ids, dtype=torch.long),
         "question_suffix": question_suffix,
         "answer": answer,
-        "question_ids": torch.tensor(
-            tokenizer.encode(question_suffix, add_special_tokens=False,
-                             max_length=model_config.max_question_tokens, truncation=True),
-            dtype=torch.long,
-        ),
         "answer_ids": torch.tensor(answer_ids, dtype=torch.long),
         "system_prompt": RAG_V1_SYSTEM_PROMPT,
     }
@@ -135,6 +140,7 @@ def run(checkpoint_path, compression_ratios, max_samples=100, seed=42):
         batch = collator([item])
         doc_token_ids = batch["doc_token_ids"]
         doc_lengths = batch["doc_lengths"]
+        preamble_ids = batch["preamble_ids"]
         stage_b_input_ids = batch["stage_b_input_ids"].to(device)
         stage_b_labels = batch["stage_b_labels"].to(device)
 
@@ -142,11 +148,15 @@ def run(checkpoint_path, compression_ratios, max_samples=100, seed=42):
             skipped += 1
             continue
 
+        # Block lengths: preamble merges with first doc
+        preamble_len = preamble_ids.shape[0]
+        block_lengths = [preamble_len + doc_lengths[0]] + doc_lengths[1:]
+
         # Stage A
         try:
             per_doc_hidden = run_stage_a(
-                model, doc_token_ids, doc_lengths,
-                stage_b_input_ids, model_config, device,
+                model, doc_token_ids, block_lengths,
+                stage_b_input_ids, preamble_ids, model_config, device,
             )
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()

@@ -222,14 +222,16 @@ def load_checkpoint(checkpoint_path, device):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def run_stage_a(model, doc_token_ids, doc_lengths, qa_input_ids, model_config, device):
-    """Run frozen LLM on [docs | Q+A] with block-diagonal mask; extract hidden states."""
+def run_stage_a(model, doc_token_ids, block_lengths, qa_input_ids,
+                preamble_ids, model_config, device):
+    """Run frozen LLM on [preamble+docs | Q+A] with block-diagonal mask; extract hidden states."""
     doc_concat = torch.cat(doc_token_ids, dim=0).unsqueeze(0).to(device)
-    full_input = torch.cat([doc_concat, qa_input_ids], dim=1)
+    preamble = preamble_ids.unsqueeze(0).to(device)
+    full_input = torch.cat([preamble, doc_concat, qa_input_ids], dim=1)
 
     qa_length = qa_input_ids.shape[1]
     attn_mask = build_block_causal_mask_with_qa(
-        doc_lengths, qa_length, dtype=torch.float16, device=device,
+        block_lengths, qa_length, dtype=torch.float16, device=device,
     )
 
     outputs = model(
@@ -238,7 +240,7 @@ def run_stage_a(model, doc_token_ids, doc_lengths, qa_input_ids, model_config, d
     )
 
     per_doc_hidden = extract_doc_hidden_states(
-        outputs.hidden_states, doc_lengths, model_config.num_layers,
+        outputs.hidden_states, block_lengths, model_config.num_layers,
     )
     return per_doc_hidden
 
@@ -382,19 +384,21 @@ def generate_no_prefix(model, prompt_ids, device, max_new_tokens=64):
 
 
 @torch.no_grad()
-def eval_ce_block_context(model, doc_token_ids, doc_lengths, comp_ids, comp_labels, device):
-    """CE eval with block-diagonal attention (docs isolated, Q+A attends to all)."""
+def eval_ce_block_context(model, doc_token_ids, block_lengths, comp_ids, comp_labels,
+                          preamble_ids, device):
+    """CE eval with block-diagonal attention (blocks isolated, Q+A attends to all)."""
     doc_concat = torch.cat(doc_token_ids, dim=0).unsqueeze(0).to(device)
-    full_input = torch.cat([doc_concat, comp_ids.to(device)], dim=1)
+    preamble = preamble_ids.unsqueeze(0).to(device)
+    full_input = torch.cat([preamble, doc_concat, comp_ids.to(device)], dim=1)
 
     qa_length = comp_ids.shape[1]
     attn_mask = build_block_causal_mask_with_qa(
-        doc_lengths, qa_length, dtype=torch.float16, device=device,
+        block_lengths, qa_length, dtype=torch.float16, device=device,
     )
 
-    doc_total = sum(doc_lengths)
-    doc_labels = torch.full((1, doc_total), -100, dtype=torch.long, device=device)
-    full_labels = torch.cat([doc_labels, comp_labels.to(device)], dim=1)
+    block_total = sum(block_lengths)
+    block_labels = torch.full((1, block_total), -100, dtype=torch.long, device=device)
+    full_labels = torch.cat([block_labels, comp_labels.to(device)], dim=1)
 
     with torch.amp.autocast("cuda"):
         outputs = model(
@@ -404,15 +408,16 @@ def eval_ce_block_context(model, doc_token_ids, doc_lengths, comp_ids, comp_labe
 
 
 @torch.no_grad()
-def generate_block_context(model, doc_token_ids, doc_lengths, comp_prompt_ids,
-                           device, max_new_tokens=64):
+def generate_block_context(model, doc_token_ids, block_lengths, comp_prompt_ids,
+                           preamble_ids, device, max_new_tokens=64):
     """Generate with block-diagonal attention for docs, then greedy decode."""
     doc_concat = torch.cat(doc_token_ids, dim=0).unsqueeze(0).to(device)
-    full_input = torch.cat([doc_concat, comp_prompt_ids.to(device)], dim=1)
+    preamble = preamble_ids.unsqueeze(0).to(device)
+    full_input = torch.cat([preamble, doc_concat, comp_prompt_ids.to(device)], dim=1)
 
     qa_length = comp_prompt_ids.shape[1]
     attn_mask = build_block_causal_mask_with_qa(
-        doc_lengths, qa_length, dtype=torch.float16, device=device,
+        block_lengths, qa_length, dtype=torch.float16, device=device,
     )
 
     # Encode with block mask, then greedy decode from the KV cache
@@ -456,29 +461,49 @@ def prep_hotpotqa_sample(sample, tokenizer, model_config):
     doc_token_ids = tokenize_documents(doc_texts, tokenizer, model_config)
     if not doc_token_ids:
         return None
+    doc_lengths = [t.shape[0] for t in doc_token_ids]
 
-    # Compressed / no-prefix: question only in user message
-    user_msg_compressed = f"Question: {question}"
-    comp_ids, comp_labels, _ = build_chat_tokens(
-        tokenizer, SYSTEM_PROMPT, user_msg_compressed, answer=gold_answer,
+    # Preamble: <|system|>\n{system_prompt}\n\n
+    preamble_text = f"<|system|>\n{SYSTEM_PROMPT}\n\n"
+    preamble_ids = torch.tensor(
+        tokenizer.encode(preamble_text, add_special_tokens=False), dtype=torch.long,
     )
-    comp_prompt_ids, _, _ = build_chat_tokens(
-        tokenizer, SYSTEM_PROMPT, user_msg_compressed, answer=None,
-    )
+    preamble_len = preamble_ids.shape[0]
 
-    # Full context: docs + question in user message
+    # Block lengths: preamble merges with first doc
+    block_lengths = [preamble_len + doc_lengths[0]] + doc_lengths[1:]
+
+    # QA suffix: <|user|>\nQuestion: {question}\n<|assistant|>\n
+    question_suffix = f"Question: {question}"
+    qa_suffix_text = f"<|user|>\n{question_suffix}\n<|assistant|>\n"
+    qa_suffix_ids = tokenizer.encode(qa_suffix_text, add_special_tokens=False)
+
+    answer_ids = tokenizer.encode(gold_answer, add_special_tokens=False,
+                                   max_length=512, truncation=True)
+
+    # Compressed / no-prefix: QA suffix + answer + EOS
+    comp_full = qa_suffix_ids + answer_ids + [tokenizer.eos_token_id]
+    answer_start = len(qa_suffix_ids)
+    comp_ids = torch.tensor([comp_full], dtype=torch.long)
+    comp_labels_list = [-100] * answer_start + answer_ids + [tokenizer.eos_token_id]
+    comp_labels = torch.tensor([comp_labels_list], dtype=torch.long)
+    comp_prompt_ids = torch.tensor([qa_suffix_ids], dtype=torch.long)
+
+    # Full context: docs in system message
     docs_text = "\n\n".join(doc_texts)
-    user_msg_full = f"{docs_text}\n\nQuestion: {question}"
+    system_with_docs = f"{SYSTEM_PROMPT}\n\n{docs_text}"
     full_ids, full_labels, _ = build_chat_tokens(
-        tokenizer, SYSTEM_PROMPT, user_msg_full, answer=gold_answer,
+        tokenizer, system_with_docs, question_suffix, answer=gold_answer,
     )
     full_prompt_ids, _, _ = build_chat_tokens(
-        tokenizer, SYSTEM_PROMPT, user_msg_full, answer=None,
+        tokenizer, system_with_docs, question_suffix, answer=None,
     )
 
     return {
         "doc_token_ids": doc_token_ids,
-        "doc_lengths": [t.shape[0] for t in doc_token_ids],
+        "doc_lengths": doc_lengths,
+        "block_lengths": block_lengths,
+        "preamble_ids": preamble_ids,
         "comp_ids": comp_ids,
         "comp_labels": comp_labels,
         "comp_prompt_ids": comp_prompt_ids,
@@ -494,10 +519,15 @@ def prep_rag_v1_sample(item, collator, tokenizer, model_config):
     batch = collator([item])
 
     doc_token_ids = batch["doc_token_ids"]
-    if not doc_token_ids or sum(batch["doc_lengths"]) == 0:
+    doc_lengths = batch["doc_lengths"]
+    if not doc_token_ids or sum(doc_lengths) == 0:
         return None
 
-    # comp_ids / comp_labels from collator — identical to test.py
+    preamble_ids = batch["preamble_ids"]
+    preamble_len = preamble_ids.shape[0]
+    block_lengths = [preamble_len + doc_lengths[0]] + doc_lengths[1:]
+
+    # comp_ids / comp_labels from collator (QA suffix only)
     comp_ids = batch["stage_b_input_ids"]
     comp_labels = batch["stage_b_labels"]
 
@@ -505,24 +535,26 @@ def prep_rag_v1_sample(item, collator, tokenizer, model_config):
     answer_start = batch["answer_start"]
     comp_prompt_ids = comp_ids[:, :answer_start]
 
-    # Full context: docs inline + question in user message
+    # Full context: docs in system message
     doc_texts = item["doc_texts"]
     docs_text = "\n\n".join(doc_texts)
     system_prompt = item["system_prompt"]
     question_suffix = item["question_suffix"]
-    user_msg_full = f"{docs_text}\n\n{question_suffix}"
+    system_with_docs = f"{system_prompt}\n\n{docs_text}"
     gold_answer = item["answer"]
 
     full_ids, full_labels, _ = build_chat_tokens(
-        tokenizer, system_prompt, user_msg_full, answer=gold_answer,
+        tokenizer, system_with_docs, question_suffix, answer=gold_answer,
     )
     full_prompt_ids, _, _ = build_chat_tokens(
-        tokenizer, system_prompt, user_msg_full, answer=None,
+        tokenizer, system_with_docs, question_suffix, answer=None,
     )
 
     return {
         "doc_token_ids": doc_token_ids,
-        "doc_lengths": batch["doc_lengths"],
+        "doc_lengths": doc_lengths,
+        "block_lengths": block_lengths,
+        "preamble_ids": preamble_ids,
         "comp_ids": comp_ids,
         "comp_labels": comp_labels,
         "comp_prompt_ids": comp_prompt_ids,
@@ -604,6 +636,8 @@ def evaluate(
 
         doc_token_ids = s["doc_token_ids"]
         doc_lengths = s["doc_lengths"]
+        block_lengths = s["block_lengths"]
+        preamble_ids = s["preamble_ids"]
         comp_ids = s["comp_ids"]
         comp_labels = s["comp_labels"]
         comp_prompt_ids = s["comp_prompt_ids"]
@@ -617,8 +651,8 @@ def evaluate(
         if qformer is not None:
             try:
                 per_doc_hidden = run_stage_a(
-                    model, doc_token_ids, doc_lengths,
-                    comp_ids.to(device), model_config, device,
+                    model, doc_token_ids, block_lengths,
+                    comp_ids.to(device), preamble_ids, model_config, device,
                 )
             except torch.cuda.OutOfMemoryError:
                 torch.cuda.empty_cache()
@@ -638,7 +672,8 @@ def evaluate(
         if qformer is None:
             try:
                 result = eval_ce_block_context(
-                    model, doc_token_ids, doc_lengths, comp_ids, comp_labels, device,
+                    model, doc_token_ids, block_lengths, comp_ids, comp_labels,
+                    preamble_ids, device,
                 )
                 if result:
                     accum["block_context"][0] += result[0]
@@ -690,7 +725,8 @@ def evaluate(
             if qformer is None:
                 try:
                     gen_tokens = generate_block_context(
-                        model, doc_token_ids, doc_lengths, comp_prompt_ids, device,
+                        model, doc_token_ids, block_lengths, comp_prompt_ids,
+                        preamble_ids, device,
                     )
                     gen_text = tokenizer.decode(gen_tokens, skip_special_tokens=True)
                     accum["block_context"][2] += compute_f1(gen_text, gold_answer)

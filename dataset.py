@@ -59,16 +59,19 @@ class RAGDataset(Dataset):
         doc_texts = parse_documents(documents_text)
         doc_token_ids = self._tokenize_documents(doc_texts)
 
-        # Build the question suffix (answer_mode + question, no docs)
-        question_suffix = f"\n\nAnswer Mode: {answer_mode}\n\nQuestion: {question}"
-
-        # Tokenize question suffix and answer (no special tokens - collator handles template)
-        question_ids = self.tokenizer.encode(
-            question_suffix,
-            add_special_tokens=False,
-            max_length=self.config.max_question_tokens,
-            truncation=True,
+        # Build preamble: <|system|>\n{system_prompt}\n\n
+        preamble_text = f"<|system|>\n{system_prompt}\n\n"
+        preamble_ids = self.tokenizer.encode(
+            preamble_text, add_special_tokens=False,
         )
+
+        # Build QA suffix: <|user|>\n{question_suffix}\n<|assistant|>\n
+        question_suffix = f"\n\nAnswer Mode: {answer_mode}\n\nQuestion: {question}"
+        qa_suffix_text = f"<|user|>\n{question_suffix}\n<|assistant|>\n"
+        qa_suffix_ids = self.tokenizer.encode(
+            qa_suffix_text, add_special_tokens=False,
+        )
+
         answer_ids = self.tokenizer.encode(
             answer,
             add_special_tokens=False,
@@ -79,9 +82,10 @@ class RAGDataset(Dataset):
         return {
             "doc_texts": doc_texts,
             "doc_token_ids": doc_token_ids,
+            "preamble_ids": torch.tensor(preamble_ids, dtype=torch.long),
+            "qa_suffix_ids": torch.tensor(qa_suffix_ids, dtype=torch.long),
             "question_suffix": question_suffix,
             "answer": answer,
-            "question_ids": torch.tensor(question_ids, dtype=torch.long),
             "answer_ids": torch.tensor(answer_ids, dtype=torch.long),
             "system_prompt": system_prompt,
         }
@@ -159,16 +163,19 @@ class HotPotQADataset(Dataset):
         # Tokenize documents
         doc_token_ids = self._tokenize_documents(doc_texts)
 
-        # Build question suffix (matches eval.py pattern)
-        question_suffix = f"Question: {question}"
-
-        # Tokenize question suffix and answer
-        question_ids = self.tokenizer.encode(
-            question_suffix,
-            add_special_tokens=False,
-            max_length=self.config.max_question_tokens,
-            truncation=True,
+        # Build preamble: <|system|>\n{system_prompt}\n\n
+        preamble_text = f"<|system|>\n{HOTPOTQA_SYSTEM_PROMPT}\n\n"
+        preamble_ids = self.tokenizer.encode(
+            preamble_text, add_special_tokens=False,
         )
+
+        # Build QA suffix: <|user|>\n{question_suffix}\n<|assistant|>\n
+        question_suffix = f"Question: {question}"
+        qa_suffix_text = f"<|user|>\n{question_suffix}\n<|assistant|>\n"
+        qa_suffix_ids = self.tokenizer.encode(
+            qa_suffix_text, add_special_tokens=False,
+        )
+
         answer_ids = self.tokenizer.encode(
             answer,
             add_special_tokens=False,
@@ -179,9 +186,10 @@ class HotPotQADataset(Dataset):
         return {
             "doc_texts": doc_texts,
             "doc_token_ids": doc_token_ids,
+            "preamble_ids": torch.tensor(preamble_ids, dtype=torch.long),
+            "qa_suffix_ids": torch.tensor(qa_suffix_ids, dtype=torch.long),
             "question_suffix": question_suffix,
             "answer": answer,
-            "question_ids": torch.tensor(question_ids, dtype=torch.long),
             "answer_ids": torch.tensor(answer_ids, dtype=torch.long),
             "system_prompt": HOTPOTQA_SYSTEM_PROMPT,
         }

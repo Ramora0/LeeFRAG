@@ -74,14 +74,16 @@ def load_checkpoint(checkpoint_path, device):
 
 
 @torch.no_grad()
-def run_stage_a(model, doc_token_ids, doc_lengths, qa_input_ids, model_config, device):
-    """Stage A: extract per-doc hidden states and teacher logits."""
+def run_stage_a(model, doc_token_ids, block_lengths, qa_input_ids,
+                preamble_ids, model_config, device):
+    """Stage A: extract per-block hidden states and teacher logits."""
     doc_concat = torch.cat(doc_token_ids, dim=0).unsqueeze(0).to(device)
-    full_input = torch.cat([doc_concat, qa_input_ids], dim=1)
+    preamble = preamble_ids.unsqueeze(0).to(device)
+    full_input = torch.cat([preamble, doc_concat, qa_input_ids], dim=1)
 
     qa_length = qa_input_ids.shape[1]
     attn_mask = build_block_causal_mask_with_qa(
-        doc_lengths, qa_length, dtype=torch.float16, device=device
+        block_lengths, qa_length, dtype=torch.float16, device=device
     )
 
     outputs = model(
@@ -92,10 +94,10 @@ def run_stage_a(model, doc_token_ids, doc_lengths, qa_input_ids, model_config, d
     )
 
     per_doc_hidden = extract_doc_hidden_states(
-        outputs.hidden_states, doc_lengths, model_config.num_layers
+        outputs.hidden_states, block_lengths, model_config.num_layers
     )
 
-    doc_total = sum(doc_lengths)
+    doc_total = sum(block_lengths)
     teacher_logits = outputs.logits[:, doc_total:, :]
 
     return per_doc_hidden, teacher_logits
@@ -243,9 +245,15 @@ def run_tests(
         if not doc_token_ids or sum(doc_lengths) == 0:
             continue
 
+        # Block lengths: preamble merges with first doc
+        preamble_ids = batch["preamble_ids"]
+        preamble_len = preamble_ids.shape[0]
+        block_lengths = [preamble_len + doc_lengths[0]] + doc_lengths[1:]
+
         # Stage A (teacher_logits unused here but available for future KL tests)
         doc_hidden_states, _ = run_stage_a(
-            model, doc_token_ids, doc_lengths, stage_b_input_ids, model_config, device
+            model, doc_token_ids, block_lengths, stage_b_input_ids,
+            preamble_ids, model_config, device
         )
 
         # Compress with trained Q-Former

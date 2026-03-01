@@ -241,16 +241,22 @@ class TwoStageTrainer:
         """
         doc_token_ids = batch["doc_token_ids"]  # list of tensors
         doc_lengths = batch["doc_lengths"]
+        preamble_ids = batch["preamble_ids"]  # tensor
         stage_b_input_ids = batch["stage_b_input_ids"].to(self.device)
         stage_b_labels = batch["stage_b_labels"].to(self.device)
 
         if not doc_token_ids or sum(doc_lengths) == 0:
             return None
 
-        # === Stage A: Run frozen LLM on [docs | Q+A], extract hidden states + teacher logits ===
+        # Block lengths: preamble merges with first doc, rest are standalone
+        preamble_len = preamble_ids.shape[0]
+        block_lengths = [preamble_len + doc_lengths[0]] + doc_lengths[1:]
+
+        # === Stage A: Run frozen LLM on [preamble+docs | Q+A], extract hidden states + teacher logits ===
         with torch.no_grad():
             doc_hidden_states, teacher_logits, teacher_qa_hidden = self._stage_a(
-                doc_token_ids, doc_lengths, stage_b_input_ids
+                doc_token_ids, doc_lengths, stage_b_input_ids,
+                preamble_ids, block_lengths,
             )
 
         if self.training_config.offload_stage_a_to_cpu:
@@ -293,27 +299,31 @@ class TwoStageTrainer:
         doc_token_ids: list[torch.Tensor],
         doc_lengths: list[int],
         qa_input_ids: torch.Tensor,
+        preamble_ids: torch.Tensor,
+        block_lengths: list[int],
     ) -> tuple[list[list[torch.Tensor]], torch.Tensor, list[torch.Tensor] | None]:
-        """Stage A: Run frozen LLM on [docs | Q+A] in one forward pass.
+        """Stage A: Run frozen LLM on [preamble+docs | Q+A] in one forward pass.
 
-        Uses block-diagonal causal mask for docs, with Q+A attending to all docs.
+        Uses block-diagonal causal mask for blocks (preamble+doc0, doc1, ...),
+        with Q+A attending to all blocks.
 
         Returns:
-            per_doc_hidden: Per-document hidden states for Q-Former compression.
+            per_doc_hidden: Per-block hidden states for Q-Former compression.
             teacher_logits: Logits over Q+A tokens [batch, qa_len, vocab_size].
             teacher_qa_hidden: Q+A hidden states per layer (if hidden_state_loss),
                 else None. Each shape: [batch, qa_len, hidden_size].
         """
-        # Concatenate: [doc0 | doc1 | ... | Q+A]
+        # Concatenate: [preamble | doc0 | doc1 | ... | Q+A]
         doc_concat = torch.cat(doc_token_ids, dim=0).unsqueeze(0).to(self.device)
-        full_input = torch.cat([doc_concat, qa_input_ids], dim=1)
+        preamble = preamble_ids.unsqueeze(0).to(self.device)
+        full_input = torch.cat([preamble, doc_concat, qa_input_ids], dim=1)
 
         qa_length = qa_input_ids.shape[1]
 
-        # Build attention mask: block-diagonal for docs, Q+A attends to all docs + causal
+        # Build attention mask: block-diagonal for blocks, Q+A attends to all blocks + causal
         dtype = torch.float16 if self.training_config.fp16 else torch.float32
         attn_mask = build_block_causal_mask_with_qa(
-            doc_lengths, qa_length, dtype=dtype, device=self.device
+            block_lengths, qa_length, dtype=dtype, device=self.device
         )
 
         # Forward through frozen LLM
@@ -324,13 +334,13 @@ class TwoStageTrainer:
             use_cache=False,
         )
 
-        # Extract per-document hidden states (from doc portion only)
+        # Extract per-block hidden states (preamble+doc0 is block 0, doc1 is block 1, etc.)
         per_doc_hidden = extract_doc_hidden_states(
-            outputs.hidden_states, doc_lengths, self.model_config.num_layers
+            outputs.hidden_states, block_lengths, self.model_config.num_layers
         )
 
         # Extract teacher logits over Q+A portion
-        doc_total = sum(doc_lengths)
+        doc_total = sum(block_lengths)
         teacher_logits = outputs.logits[:, doc_total:, :]
 
         # Extract teacher Q+A hidden states for hidden state matching
@@ -536,15 +546,21 @@ class TwoStageTrainer:
         for batch in eval_pbar:
             doc_token_ids = batch["doc_token_ids"]
             doc_lengths = batch["doc_lengths"]
+            preamble_ids = batch["preamble_ids"]
             stage_b_input_ids = batch["stage_b_input_ids"].to(self.device)
             stage_b_labels = batch["stage_b_labels"].to(self.device)
 
             if not doc_token_ids or sum(doc_lengths) == 0:
                 continue
 
+            # Block lengths: preamble merges with first doc
+            preamble_len = preamble_ids.shape[0]
+            block_lengths = [preamble_len + doc_lengths[0]] + doc_lengths[1:]
+
             # Stage A
             doc_hidden_states, teacher_logits, teacher_qa_hidden = self._stage_a(
-                doc_token_ids, doc_lengths, stage_b_input_ids
+                doc_token_ids, doc_lengths, stage_b_input_ids,
+                preamble_ids, block_lengths,
             )
             if self.training_config.offload_stage_a_to_cpu:
                 doc_hidden_states = [
