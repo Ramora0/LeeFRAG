@@ -57,7 +57,11 @@ def load_checkpoint(checkpoint_path, device):
 
     qformer = QFormerKVCompressor(qformer_config, model_config).to(device)
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    qformer.load_state_dict(ckpt["qformer_state_dict"])
+
+    # Strip _orig_mod. prefixes from torch.compile'd checkpoints
+    state_dict = ckpt["qformer_state_dict"]
+    state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+    qformer.load_state_dict(state_dict)
     qformer.eval()
 
     compression_ratio = ckpt.get("compression_ratio", 4)
