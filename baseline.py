@@ -6,6 +6,7 @@ Baselines:
 3. Mean-pooled KV at 2x, 4x, 8x, 16x — naive compression floor.
 """
 
+import argparse
 import json
 import logging
 import math
@@ -25,7 +26,7 @@ from block_attention import (
 )
 from collator import RAGCollator
 from config import ModelConfig, TrainingConfig
-from dataset import RAGDataset
+from dataset import create_dataset
 from kv_cache_utils import build_dynamic_cache
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -372,7 +373,7 @@ def _compute_token_loss(logits, labels):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate_baseline():
+def evaluate_baseline(dataset_name: str = "rag_v1"):
     model_config = ModelConfig()
     training_config = TrainingConfig()
 
@@ -389,8 +390,9 @@ def evaluate_baseline():
     )
     model.eval()
 
-    logger.info("Loading eval dataset")
-    dataset = RAGDataset(
+    logger.info(f"Loading eval dataset ({dataset_name})")
+    dataset = create_dataset(
+        dataset_name=dataset_name,
         tokenizer=tokenizer,
         model_config=model_config,
         split="eval",
@@ -405,14 +407,14 @@ def evaluate_baseline():
     # === Baseline 1: Full causal attention ===
     causal_loss, causal_ppl, causal_n, causal_tok = eval_loop(
         "Full Causal", dataset, model, tokenizer, device,
-        forward_full_causal, cache_name="full_causal",
+        forward_full_causal, cache_name=f"{dataset_name}_full_causal",
     )
     results["full_causal"] = {"loss": causal_loss, "ppl": causal_ppl}
 
     # === Baseline 2: Block attention ===
     block_loss, block_ppl, block_n, block_tok = eval_loop(
         "Block Attention", dataset, model, tokenizer, device,
-        forward_block_attention, cache_name="block_attention",
+        forward_block_attention, cache_name=f"{dataset_name}_block_attention",
     )
     results["block_attention"] = {"loss": block_loss, "ppl": block_ppl}
 
@@ -421,7 +423,7 @@ def evaluate_baseline():
     pool_results = {}
     for ratio in compression_ratios:
         name = f"Mean Pool {ratio}x"
-        cache_name = f"mean_pool_{ratio}x"
+        cache_name = f"{dataset_name}_mean_pool_{ratio}x"
         forward_fn = partial(forward_mean_pool, compression_ratio=ratio)
         loss, ppl, n_samples, n_tokens = eval_loop(
             name, dataset, model, tokenizer, device,
@@ -432,7 +434,7 @@ def evaluate_baseline():
 
     # === Results ===
     logger.info("=" * 70)
-    logger.info("BASELINE RESULTS")
+    logger.info(f"BASELINE RESULTS [{dataset_name}]")
     logger.info("=" * 70)
     logger.info(
         f"  Full Causal:     CE={causal_loss:.4f}  PPL={causal_ppl:.2f}  "
@@ -459,4 +461,10 @@ def evaluate_baseline():
 
 
 if __name__ == "__main__":
-    evaluate_baseline()
+    parser = argparse.ArgumentParser(description="Baseline evaluation (no Q-Former)")
+    parser.add_argument(
+        "--dataset", type=str, default="rag_v1", choices=["rag_v1", "hotpotqa"],
+        help="Dataset to evaluate on (default: rag_v1)",
+    )
+    args = parser.parse_args()
+    evaluate_baseline(dataset_name=args.dataset)
