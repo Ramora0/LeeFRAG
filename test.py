@@ -196,6 +196,7 @@ def evaluate_baseline():
         model_config.model_name,
         torch_dtype=torch.float16,
         device_map="auto",
+        attn_implementation="eager",
     )
     model.eval()
 
