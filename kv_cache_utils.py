@@ -81,18 +81,18 @@ def apply_rope_to_cache(
         The same cache with RoPE applied to all K values in-place.
     """
     prefix_len = cache.get_seq_length()
-    device = cache.key_cache[0].device
+    device = cache.layers[0].keys.device
     position_ids = torch.arange(prefix_len, device=device).unsqueeze(0)
 
     # Get cos/sin from the model's rotary embedding
-    cos, sin = rotary_emb(cache.key_cache[0], position_ids=position_ids)
+    cos, sin = rotary_emb(cache.layers[0].keys, position_ids=position_ids)
     # cos, sin: [1, prefix_len, head_dim]
     cos = cos.unsqueeze(1)  # [1, 1, prefix_len, head_dim]
     sin = sin.unsqueeze(1)  # [1, 1, prefix_len, head_dim]
 
     for layer_idx in range(num_layers):
-        k = cache.key_cache[layer_idx]  # [batch, num_kv_heads, prefix_len, head_dim]
-        cache.key_cache[layer_idx] = (k * cos) + (_rotate_half(k) * sin)
+        k = cache.layers[layer_idx].keys  # [batch, num_kv_heads, prefix_len, head_dim]
+        cache.layers[layer_idx].keys = (k * cos) + (_rotate_half(k) * sin)
 
     return cache
 
