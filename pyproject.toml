@@ -1,0 +1,20 @@
+[project]
+name = "leefrag"
+version = "0.1.0"
+description = "KV Cache Compression Training Pipeline for RAG using Q-Former"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1.0",
+    "transformers>=4.40.0",
+    "datasets>=2.18.0",
+    "accelerate>=0.28.0",
+    "safetensors>=0.4.0",
+    "sentencepiece>=0.2.0",
+    "protobuf>=4.25.0",
+    "tqdm>=4.66.0",
+    "wandb>=0.16.0",
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
