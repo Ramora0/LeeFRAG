@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 
 @dataclass
 class ModelConfig:
-    model_name: str = "meta-llama/Meta-Llama-3-8B-Instruct"
+    model_name: str = "meta-llama/Meta-Llama-3.1-8B-Instruct"
     torch_dtype: str = "float16"
     max_doc_tokens: int = 1024
     max_total_doc_tokens: int = 4096
