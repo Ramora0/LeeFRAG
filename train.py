@@ -12,7 +12,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from config import ModelConfig, QFormerConfig, TrainingConfig
 from collator import RAGCollator
-from dataset import RAGDataset
+from dataset import create_dataset
 from qformer import QFormerKVCompressor
 from trainer import TwoStageTrainer
 
@@ -30,6 +30,8 @@ def set_seed(seed: int):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train Q-Former KV cache compressor")
+    parser.add_argument("--dataset", type=str, default="rag_v1", choices=["rag_v1", "hotpotqa"],
+                        help="Dataset to train on (default: rag_v1)")
     parser.add_argument("--output_dir", type=str, default="outputs")
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--num_epochs", type=int, default=4)
@@ -106,15 +108,17 @@ def main():
     logger.info(f"Q-Former trainable params: {trainable_params / 1e6:.1f}M")
 
     # Load datasets
-    logger.info("Loading datasets...")
-    train_dataset = RAGDataset(
+    logger.info(f"Loading datasets ({args.dataset})...")
+    train_dataset = create_dataset(
+        dataset_name=args.dataset,
         tokenizer=tokenizer,
         model_config=model_config,
         split="train",
         eval_split_ratio=training_config.eval_split_ratio,
         seed=training_config.seed,
     )
-    eval_dataset = RAGDataset(
+    eval_dataset = create_dataset(
+        dataset_name=args.dataset,
         tokenizer=tokenizer,
         model_config=model_config,
         split="eval",
