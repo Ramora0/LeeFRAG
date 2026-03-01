@@ -9,10 +9,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, PreTrainedTokenizer
 
 from config import ModelConfig, QFormerConfig, TrainingConfig
-from block_attention import (
-    build_block_causal_mask_with_qa,
-    build_prefix_causal_mask,
-)
+from block_attention import build_block_causal_mask_with_qa
 from kv_cache_utils import apply_rope_to_cache, concat_compressed_caches, extract_doc_hidden_states
 from qformer import QFormerKVCompressor
 from scheduler import CompressionScheduler
@@ -97,9 +94,14 @@ class TwoStageTrainer:
         global_step = 0
         accumulation_count = 0
 
-        for epoch in range(self.training_config.num_epochs):
-            ema_loss = None
+        # Accumulators for averaging metrics over gradient accumulation steps
+        accum_loss = 0.0
+        accum_ce = 0.0
+        accum_kl = 0.0
+        accum_empirical_ratio = 0.0
+        accum_micro_batches = 0
 
+        for epoch in range(self.training_config.num_epochs):
             pbar = tqdm(
                 self.train_loader,
                 desc=f"Epoch {epoch+1}/{self.training_config.num_epochs}",
@@ -120,8 +122,13 @@ class TwoStageTrainer:
                 self.scaler.scale(loss).backward()
 
                 accumulation_count += 1
-                step_loss = loss.item() * self.training_config.gradient_accumulation_steps
-                ema_loss = step_loss if ema_loss is None else 0.95 * ema_loss + 0.05 * step_loss
+
+                # Accumulate per-micro-batch metrics
+                accum_loss += loss.item() * self.training_config.gradient_accumulation_steps
+                accum_ce += self._last_ce_loss
+                accum_kl += self._last_kl_loss
+                accum_empirical_ratio += self._last_empirical_ratio
+                accum_micro_batches += 1
 
                 if accumulation_count % self.training_config.gradient_accumulation_steps == 0:
                     # Gradient clipping
@@ -140,15 +147,26 @@ class TwoStageTrainer:
 
                     global_step += 1
 
+                    # Average metrics over gradient accumulation micro-batches
+                    avg_loss = accum_loss / accum_micro_batches
+                    avg_ce = accum_ce / accum_micro_batches
+                    avg_kl = accum_kl / accum_micro_batches
+                    avg_empirical_ratio = accum_empirical_ratio / accum_micro_batches
+
+                    # Reset accumulators
+                    accum_loss = 0.0
+                    accum_ce = 0.0
+                    accum_kl = 0.0
+                    accum_empirical_ratio = 0.0
+                    accum_micro_batches = 0
+
                     # Update progress bar
                     lr = self.optimizer.param_groups[0]["lr"]
                     phase = self.compression_scheduler.get_phase(global_step)
-                    ce = getattr(self, "_last_ce_loss", 0.0)
-                    kl = getattr(self, "_last_kl_loss", 0.0)
                     pbar.set_postfix(
-                        loss=f"{ema_loss:.4f}",
-                        ce=f"{ce:.4f}",
-                        kl=f"{kl:.4f}",
+                        loss=f"{avg_loss:.4f}",
+                        ce=f"{avg_ce:.4f}",
+                        kl=f"{avg_kl:.4f}",
                         lr=f"{lr:.2e}",
                         comp=f"{compression_ratio}x",
                         step=f"{global_step}/{self.total_steps}",
@@ -158,11 +176,12 @@ class TwoStageTrainer:
                         if self.use_wandb:
                             import wandb
                             wandb.log({
-                                "train/loss": ema_loss,
-                                "train/ce_loss": ce,
-                                "train/kl_loss": kl,
+                                "train/loss": avg_loss,
+                                "train/ce_loss": avg_ce,
+                                "train/kl_loss": avg_kl,
                                 "train/lr": lr,
                                 "train/compression_ratio": compression_ratio,
+                                "train/empirical_compression_ratio": avg_empirical_ratio,
                                 "train/phase": phase,
                                 "train/global_step": global_step,
                             })
@@ -300,9 +319,13 @@ class TwoStageTrainer:
         """
         # Compress each document's hidden states into KV caches
         per_doc_compressed = []
+        empirical_ratios = []
         for doc_hs in doc_hidden_states:
             compressed = self.qformer(doc_hs, compression_ratio)
             per_doc_compressed.append(compressed)
+            doc_len = doc_hs[0].shape[1]
+            num_queries = compressed[0][0].shape[2]  # [1, num_kv_heads, num_queries, head_dim]
+            empirical_ratios.append(doc_len / num_queries)
 
         # Concatenate compressed caches from all documents
         compressed_cache = concat_compressed_caches(
@@ -317,18 +340,12 @@ class TwoStageTrainer:
             compressed_cache, self.model_config.num_layers, rotary_emb
         )
 
-        # Build attention mask for prefix + sequence
-        prefix_length = compressed_cache.get_seq_length()
-        seq_length = input_ids.shape[1]
-        dtype = torch.float16 if self.training_config.fp16 else torch.float32
-        attn_mask = build_prefix_causal_mask(
-            prefix_length, seq_length, dtype=dtype, device=self.device
-        )
-
         # Forward through frozen LLM with compressed KV prefix
+        # No explicit attention_mask: HF generates the correct prefix-causal
+        # pattern from past_key_values (full attn to prefix + causal among new
+        # tokens). Omitting it lets SDPA use the FlashAttention backend.
         outputs = self.model(
             input_ids=input_ids,
-            attention_mask=attn_mask,
             past_key_values=compressed_cache,
             use_cache=False,
         )
@@ -353,6 +370,7 @@ class TwoStageTrainer:
         # Stash components for logging (detached)
         self._last_ce_loss = ce_loss.item()
         self._last_kl_loss = kl_loss.item()
+        self._last_empirical_ratio = sum(empirical_ratios) / len(empirical_ratios)
 
         return total_loss
 
@@ -467,16 +485,8 @@ class TwoStageTrainer:
                     compressed_cache, self.model_config.num_layers, rotary_emb
                 )
 
-                prefix_length = compressed_cache.get_seq_length()
-                seq_length = stage_b_input_ids.shape[1]
-                dtype = torch.float16 if self.training_config.fp16 else torch.float32
-                attn_mask = build_prefix_causal_mask(
-                    prefix_length, seq_length, dtype=dtype, device=self.device
-                )
-
                 outputs = self.model(
                     input_ids=stage_b_input_ids,
-                    attention_mask=attn_mask,
                     past_key_values=compressed_cache,
                     use_cache=False,
                 )

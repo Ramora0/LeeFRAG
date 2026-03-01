@@ -3,13 +3,13 @@ from dataclasses import dataclass, field
 
 @dataclass
 class ModelConfig:
-    model_name: str = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+    model_name: str = "ldsjmdy/Tulu3-Block-FT"
     torch_dtype: str = "float16"
     max_doc_tokens: int = 1024
     max_total_doc_tokens: int = 4096
     max_question_tokens: int = 256
     max_answer_tokens: int = 512
-    # LLaMA 3 8B architecture
+    # LLaMA 3.1 8B architecture (Tulu3-Block-FT)
     num_layers: int = 32
     num_kv_heads: int = 8
     head_dim: int = 128
@@ -25,7 +25,7 @@ class QFormerConfig:
     dropout: float = 0.1
     max_query_tokens: int = 512
     cross_attn_mode: str = "global"  # "global" or "windowed"
-    gradient_checkpointing: bool = True
+    gradient_checkpointing: bool = False
 
 
 @dataclass

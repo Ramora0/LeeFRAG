@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 LeeFRAG is a KV cache compression training pipeline for RAG (Retrieval-Augmented Generation). It trains a Q-Former model to compress document KV caches so a frozen LLM can use compressed context instead of full documents, reducing memory/compute at inference time.
 
-**Base model**: `glaiveai/Llama-3-8B-RAG-v1` (LLaMA 3 8B, frozen during training)
+**Base model**: `ldsjmdy/Tulu3-Block-FT` (LLaMA 3.1 8B with Tulu 3 chat template, frozen during training)
 **Dataset**: `glaiveai/RAG-v1` (loaded via HuggingFace `datasets`)
 
 ## Commands
@@ -66,7 +66,7 @@ Three mask types:
 ### Data Pipeline
 
 - `dataset.py`: `RAGDataset` parses `Document:N` formatted text, tokenizes docs individually with per-doc (1024) and total (4096) token limits
-- `collator.py`: `RAGCollator` builds Stage B input using Llama 3 chat template. Labels mask everything except answer tokens (-100)
+- `collator.py`: `RAGCollator` builds Stage B input using Tulu 3 chat template. Labels mask everything except answer tokens (-100)
 
 ### KV Cache Utilities (kv_cache_utils.py)
 

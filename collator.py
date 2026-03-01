@@ -7,6 +7,7 @@ class RAGCollator:
 
     Since batch_size=1, this mostly restructures a single sample.
     Builds the chat template tokens for Stage B (question + answer).
+    Uses the Tulu 3 chat template format.
     """
 
     def __init__(self, tokenizer: PreTrainedTokenizer):
@@ -36,16 +37,15 @@ class RAGCollator:
         }
 
     def _build_stage_b_tokens(self, item: dict) -> tuple[torch.Tensor, int, int]:
-        """Build tokenized Stage B input using the chat template.
+        """Build tokenized Stage B input using the Tulu 3 chat template.
 
-        Format (Llama 3 chat template):
-        <|begin_of_text|><|start_header_id|>system<|end_header_id|>
-
-        {system_prompt}<|eot_id|><|start_header_id|>user<|end_header_id|>
-
-        {question_suffix}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
-
-        {answer}<|eot_id|>
+        Format (Tulu 3 chat template):
+        <|system|>
+        {system_prompt}
+        <|user|>
+        {question_suffix}
+        <|assistant|>
+        {answer}<|end_of_text|>
 
         Note: Documents are NOT included here - they come from the KV cache prefix.
         The question_suffix contains "Answer Mode: X\\n\\nQuestion: Y".
@@ -69,10 +69,8 @@ class RAGCollator:
 
         answer_ids = item["answer_ids"].tolist()
 
-        # Add EOS after answer
-        eos_id = self.tokenizer.eos_token_id
-        eot_id = self.tokenizer.convert_tokens_to_ids("<|eot_id|>")
-        end_token = eot_id if eot_id is not None and eot_id != self.tokenizer.unk_token_id else eos_id
+        # Add EOS after answer (Tulu 3 uses <|end_of_text|> as the end-of-turn token)
+        end_token = self.tokenizer.eos_token_id
 
         full_ids = prompt_ids + answer_ids + [end_token]
         answer_start = len(prompt_ids)

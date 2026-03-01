@@ -147,8 +147,8 @@ def build_baseline_input(
     prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
     answer_ids = item["answer_ids"].tolist()
 
-    eot_id = tokenizer.convert_tokens_to_ids("<|eot_id|>")
-    end_token = eot_id if eot_id is not None and eot_id != tokenizer.unk_token_id else tokenizer.eos_token_id
+    # Tulu 3 uses <|end_of_text|> (EOS) as the end-of-turn token
+    end_token = tokenizer.eos_token_id
     full_ids = prompt_ids + answer_ids + [end_token]
 
     if len(full_ids) > max_total_tokens:
