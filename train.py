@@ -98,6 +98,7 @@ def main():
     # Build Q-Former
     logger.info("Building Q-Former KV compressor")
     qformer = QFormerKVCompressor(qformer_config, model_config).to(device)
+    qformer.trunk = torch.compile(qformer.trunk, dynamic=True)
     trainable_params = sum(p.numel() for p in qformer.parameters() if p.requires_grad)
     logger.info(f"Q-Former trainable params: {trainable_params / 1e6:.1f}M")
 
