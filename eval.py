@@ -82,6 +82,15 @@ def compute_em(prediction: str, ground_truth: str) -> float:
     return float(normalize_answer(prediction) == normalize_answer(ground_truth))
 
 
+def best_subspan_em(prediction: str, ground_truths: list[str]) -> float:
+    """Block-Attention's accuracy metric: normalized gold is a substring of normalized prediction."""
+    normalized_prediction = normalize_answer(prediction)
+    for ground_truth in ground_truths:
+        if normalize_answer(ground_truth) in normalized_prediction:
+            return 1.0
+    return 0.0
+
+
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
@@ -576,8 +585,8 @@ def evaluate(
     conditions += [f"compressed_{r}x" for r in compression_ratios]
     conditions.append("no_prefix")
 
-    # Accumulators: {condition: [ce_sum, n_tokens, f1_sum, em_sum, gen_count]}
-    accum = {c: [0.0, 0, 0.0, 0.0, 0] for c in conditions}
+    # Accumulators: {condition: [ce_sum, n_tokens, f1_sum, em_sum, subspan_em_sum, gen_count]}
+    accum = {c: [0.0, 0, 0.0, 0.0, 0.0, 0] for c in conditions}
 
     pbar = tqdm(range(n_samples), desc=f"{dataset_name} eval")
     skipped = 0
@@ -670,7 +679,8 @@ def evaluate(
                 gen_text = tokenizer.decode(gen_tokens, skip_special_tokens=True)
                 accum["full_context"][2] += compute_f1(gen_text, gold_answer)
                 accum["full_context"][3] += compute_em(gen_text, gold_answer)
-                accum["full_context"][4] += 1
+                accum["full_context"][4] += best_subspan_em(gen_text, [gold_answer])
+                accum["full_context"][5] += 1
                 if verbose:
                     sample_gens["full_context"] = gen_text
             except torch.cuda.OutOfMemoryError:
@@ -685,7 +695,8 @@ def evaluate(
                     gen_text = tokenizer.decode(gen_tokens, skip_special_tokens=True)
                     accum["block_context"][2] += compute_f1(gen_text, gold_answer)
                     accum["block_context"][3] += compute_em(gen_text, gold_answer)
-                    accum["block_context"][4] += 1
+                    accum["block_context"][4] += best_subspan_em(gen_text, [gold_answer])
+                    accum["block_context"][5] += 1
                     if verbose:
                         sample_gens["block_context"] = gen_text
                 except torch.cuda.OutOfMemoryError:
@@ -703,7 +714,8 @@ def evaluate(
                         gen_text = tokenizer.decode(gen_tokens, skip_special_tokens=True)
                         accum[cond][2] += compute_f1(gen_text, gold_answer)
                         accum[cond][3] += compute_em(gen_text, gold_answer)
-                        accum[cond][4] += 1
+                        accum[cond][4] += best_subspan_em(gen_text, [gold_answer])
+                        accum[cond][5] += 1
                         if verbose:
                             sample_gens[cond] = gen_text
                     except torch.cuda.OutOfMemoryError:
@@ -715,7 +727,8 @@ def evaluate(
                 gen_text = tokenizer.decode(gen_tokens, skip_special_tokens=True)
                 accum["no_prefix"][2] += compute_f1(gen_text, gold_answer)
                 accum["no_prefix"][3] += compute_em(gen_text, gold_answer)
-                accum["no_prefix"][4] += 1
+                accum["no_prefix"][4] += best_subspan_em(gen_text, [gold_answer])
+                accum["no_prefix"][5] += 1
                 if verbose:
                     sample_gens["no_prefix"] = gen_text
             except torch.cuda.OutOfMemoryError:
@@ -751,12 +764,12 @@ def evaluate(
 
     header = f"{'Condition':<22s} {'CE':>7s} {'PPL':>8s}"
     if not ce_only:
-        header += f" {'F1':>7s} {'EM':>7s} {'n_gen':>6s}"
+        header += f" {'F1':>7s} {'EM':>7s} {'Sub-EM':>7s} {'n_gen':>6s}"
     print(header)
     print("-" * len(header))
 
     for cond in conditions:
-        ce_sum, n_tok, f1_sum, em_sum, gen_count = accum[cond]
+        ce_sum, n_tok, f1_sum, em_sum, subspan_em_sum, gen_count = accum[cond]
         if n_tok == 0:
             print(f"  {cond:<20s}  {'--':>7s} {'--':>8s}")
             continue
@@ -767,9 +780,10 @@ def evaluate(
             if gen_count > 0:
                 f1 = f1_sum / gen_count
                 em = em_sum / gen_count
-                line += f" {f1:>7.4f} {em:>7.4f} {gen_count:>6d}"
+                sub_em = subspan_em_sum / gen_count
+                line += f" {f1:>7.4f} {em:>7.4f} {sub_em:>7.4f} {gen_count:>6d}"
             else:
-                line += f" {'--':>7s} {'--':>7s} {'0':>6s}"
+                line += f" {'--':>7s} {'--':>7s} {'--':>7s} {'0':>6s}"
         print(line)
 
     print("=" * 80)
