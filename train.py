@@ -45,6 +45,8 @@ def parse_args():
     parser.add_argument("--kl_top_k", type=int, default=0, help="Top-k logits for KL (0=full vocab)")
     parser.add_argument("--cross_attn_mode", type=str, default="global", choices=["global", "windowed"])
     parser.add_argument("--resume_from", type=str, default=None, help="Path to checkpoint to resume from")
+    parser.add_argument("--compression_schedule", type=int, nargs="+", default=[2, 4, 8, 16],
+                        help="Compression ratio schedule (default: 2 4 8 16)")
     return parser.parse_args()
 
 
@@ -66,6 +68,7 @@ def main():
         offload_stage_a_to_cpu=args.offload_stage_a_to_cpu,
         kl_weight=args.kl_weight,
         kl_top_k=args.kl_top_k,
+        compression_schedule=args.compression_schedule,
     )
 
     qformer_config = QFormerConfig(cross_attn_mode=args.cross_attn_mode)
