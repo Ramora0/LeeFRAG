@@ -372,6 +372,67 @@ def generate_no_prefix(model, prompt_ids, device, max_new_tokens=64):
     return greedy_decode(model, prompt_ids, device, max_new_tokens)
 
 
+@torch.no_grad()
+def eval_ce_block_context(model, doc_token_ids, doc_lengths, comp_ids, comp_labels, device):
+    """CE eval with block-diagonal attention (docs isolated, Q+A attends to all)."""
+    doc_concat = torch.cat(doc_token_ids, dim=0).unsqueeze(0).to(device)
+    full_input = torch.cat([doc_concat, comp_ids.to(device)], dim=1)
+
+    qa_length = comp_ids.shape[1]
+    attn_mask = build_block_causal_mask_with_qa(
+        doc_lengths, qa_length, dtype=torch.float16, device=device,
+    )
+
+    doc_total = sum(doc_lengths)
+    doc_labels = torch.full((1, doc_total), -100, dtype=torch.long, device=device)
+    full_labels = torch.cat([doc_labels, comp_labels.to(device)], dim=1)
+
+    with torch.amp.autocast("cuda"):
+        outputs = model(
+            input_ids=full_input, attention_mask=attn_mask, use_cache=False,
+        )
+    return compute_ce_loss(outputs.logits, full_labels)
+
+
+@torch.no_grad()
+def generate_block_context(model, doc_token_ids, doc_lengths, comp_prompt_ids,
+                           device, max_new_tokens=64):
+    """Generate with block-diagonal attention for docs, then greedy decode."""
+    doc_concat = torch.cat(doc_token_ids, dim=0).unsqueeze(0).to(device)
+    full_input = torch.cat([doc_concat, comp_prompt_ids.to(device)], dim=1)
+
+    qa_length = comp_prompt_ids.shape[1]
+    attn_mask = build_block_causal_mask_with_qa(
+        doc_lengths, qa_length, dtype=torch.float16, device=device,
+    )
+
+    # Encode with block mask, then greedy decode from the KV cache
+    with torch.amp.autocast("cuda"):
+        outputs = model(
+            input_ids=full_input, attention_mask=attn_mask, use_cache=True,
+        )
+
+    cache = outputs.past_key_values
+    generated = []
+    next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+    generated.append(next_token)
+
+    for _ in range(max_new_tokens - 1):
+        if next_token.item() == model.config.eos_token_id:
+            break
+        with torch.amp.autocast("cuda"):
+            outputs = model(
+                input_ids=next_token, past_key_values=cache, use_cache=True,
+            )
+        next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        generated.append(next_token)
+        cache = outputs.past_key_values
+
+    if generated:
+        return torch.cat(generated, dim=-1)[0]
+    return torch.tensor([], dtype=torch.long, device=device)
+
+
 # ---------------------------------------------------------------------------
 # Per-sample data prep (unified across datasets)
 # ---------------------------------------------------------------------------
@@ -483,7 +544,7 @@ def evaluate(
         model, tokenizer, model_config = load_model(device)
         qformer = None
         compression_ratios = []
-        logger.info("No checkpoint — running full_context and no_prefix only")
+        logger.info("No checkpoint — running full_context, block_context, and no_prefix")
 
     # Load dataset
     if dataset_name == "hotpotqa":
@@ -508,8 +569,12 @@ def evaluate(
     verbose = n_samples <= 10 and not ce_only
     logger.info(f"Evaluating on {n_samples} samples from {dataset_name}")
 
-    # Condition names: full_context, compressed_Nx (per ratio), no_prefix
-    conditions = ["full_context"] + [f"compressed_{r}x" for r in compression_ratios] + ["no_prefix"]
+    # Condition names: full_context, block_context (raw model only), compressed_Nx, no_prefix
+    conditions = ["full_context"]
+    if qformer is None:
+        conditions.append("block_context")
+    conditions += [f"compressed_{r}x" for r in compression_ratios]
+    conditions.append("no_prefix")
 
     # Accumulators: {condition: [ce_sum, n_tokens, f1_sum, em_sum, gen_count]}
     accum = {c: [0.0, 0, 0.0, 0.0, 0] for c in conditions}
@@ -560,6 +625,18 @@ def evaluate(
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()
 
+        # === Block context CE (raw model only) ===
+        if qformer is None:
+            try:
+                result = eval_ce_block_context(
+                    model, doc_token_ids, doc_lengths, comp_ids, comp_labels, device,
+                )
+                if result:
+                    accum["block_context"][0] += result[0]
+                    accum["block_context"][1] += result[1]
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+
         # === Compressed CE (per ratio) ===
         for ratio in compression_ratios:
             cond = f"compressed_{ratio}x"
@@ -598,6 +675,21 @@ def evaluate(
                     sample_gens["full_context"] = gen_text
             except torch.cuda.OutOfMemoryError:
                 torch.cuda.empty_cache()
+
+            # Block context generation (raw model only)
+            if qformer is None:
+                try:
+                    gen_tokens = generate_block_context(
+                        model, doc_token_ids, doc_lengths, comp_prompt_ids, device,
+                    )
+                    gen_text = tokenizer.decode(gen_tokens, skip_special_tokens=True)
+                    accum["block_context"][2] += compute_f1(gen_text, gold_answer)
+                    accum["block_context"][3] += compute_em(gen_text, gold_answer)
+                    accum["block_context"][4] += 1
+                    if verbose:
+                        sample_gens["block_context"] = gen_text
+                except torch.cuda.OutOfMemoryError:
+                    torch.cuda.empty_cache()
 
             # Compressed generation (per ratio, only if Q-Former loaded)
             if qformer is not None:
@@ -643,6 +735,8 @@ def evaluate(
             fc_ce = accum["full_context"][0] / accum["full_context"][1]
             np_ce = accum["no_prefix"][0] / max(accum["no_prefix"][1], 1)
             postfix = {"full": f"{fc_ce:.3f}", "none": f"{np_ce:.3f}"}
+            if "block_context" in accum and accum["block_context"][1] > 0:
+                postfix["block"] = f"{accum['block_context'][0] / accum['block_context'][1]:.3f}"
             for ratio in compression_ratios[:2]:
                 cond = f"compressed_{ratio}x"
                 if accum[cond][1] > 0:
