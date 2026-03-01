@@ -31,8 +31,9 @@ def build_block_causal_mask(
     offset = 0
     for length in doc_lengths:
         # Causal mask within this block: lower-triangular
-        block_mask = torch.tril(
-            torch.zeros(length, length, dtype=dtype, device=device)
+        block_mask = torch.triu(
+            torch.full((length, length), float("-inf"), dtype=dtype, device=device),
+            diagonal=1,
         )
         mask[offset : offset + length, offset : offset + length] = block_mask
         offset += length
@@ -79,8 +80,9 @@ def build_block_causal_mask_with_qa(
     # Document blocks: block-diagonal causal
     offset = 0
     for length in doc_lengths:
-        block_mask = torch.tril(
-            torch.zeros(length, length, dtype=dtype, device=device)
+        block_mask = torch.triu(
+            torch.full((length, length), float("-inf"), dtype=dtype, device=device),
+            diagonal=1,
         )
         mask[offset : offset + length, offset : offset + length] = block_mask
         offset += length
