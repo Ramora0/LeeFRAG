@@ -58,6 +58,12 @@ The learned query embeddings are the same regardless of document content. Sinuso
 ### Compression Schedule Rigidity
 The schedule divides training into 4 equal phases (2x, 4x, 8x, 16x). If the model hasn't converged at 2x before switching to 4x, higher compression phases inherit a poor compressor. There's no adaptive mechanism — it switches purely by step count.
 
+### Sequential Q-Former Document Processing
+The Q-Former processes documents one at a time in a loop (`_stage_b`), unlike Stage A which concatenates all documents and uses a block-diagonal causal mask for a single batched forward pass. The Q-Former could similarly concatenate all documents' queries and hidden states into one forward pass with block attention masks on both self-attention and cross-attention, keeping documents independent while enabling GPU parallelism. This would also require handling variable `num_queries` per document (due to different doc lengths).
+
+### RoPE Leaks Absolute Position Into Compressed KV
+The frozen LLM applies RoPE during Stage A, so the hidden states the Q-Former cross-attends to have absolute document position baked in. The Q-Former's output KV projections carry this positional signal into the compressed KV cache. When the decoder attends to the compressed prefix, RoPE is applied again at prefix positions, resulting in double-encoded and mismatched positional information. Ideally, RoPE should be undone on the hidden states entering the Q-Former and re-applied to the output KV caches at their correct prefix positions.
+
 ### Single-Document Compression
 Each document is compressed independently. Cross-document information (redundancy, contradictions) is not exploited during compression. Two documents saying the same thing produce two separate compressed caches rather than being deduplicated.
 

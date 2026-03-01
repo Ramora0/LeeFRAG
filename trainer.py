@@ -5,6 +5,7 @@ import os
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 from transformers import AutoModelForCausalLM, PreTrainedTokenizer
 
 from config import ModelConfig, QFormerConfig, TrainingConfig
@@ -96,7 +97,12 @@ class TwoStageTrainer:
             epoch_loss = 0.0
             epoch_steps = 0
 
-            for batch_idx, batch in enumerate(self.train_loader):
+            pbar = tqdm(
+                self.train_loader,
+                desc=f"Epoch {epoch+1}/{self.training_config.num_epochs}",
+                leave=True,
+            )
+            for batch_idx, batch in enumerate(pbar):
                 compression_ratio = self.compression_scheduler.get_compression_ratio(
                     global_step
                 )
@@ -131,20 +137,22 @@ class TwoStageTrainer:
                     global_step += 1
                     epoch_steps += 1
 
-                    # Logging
+                    # Update progress bar
+                    avg_loss = epoch_loss / epoch_steps
+                    lr = self.optimizer.param_groups[0]["lr"]
+                    phase = self.compression_scheduler.get_phase(global_step)
+                    ce = getattr(self, "_last_ce_loss", 0.0)
+                    kl = getattr(self, "_last_kl_loss", 0.0)
+                    pbar.set_postfix(
+                        loss=f"{avg_loss:.4f}",
+                        ce=f"{ce:.4f}",
+                        kl=f"{kl:.4f}",
+                        lr=f"{lr:.2e}",
+                        comp=f"{compression_ratio}x",
+                        step=f"{global_step}/{self.total_steps}",
+                    )
+
                     if global_step % self.training_config.logging_steps == 0:
-                        avg_loss = epoch_loss / epoch_steps
-                        lr = self.optimizer.param_groups[0]["lr"]
-                        phase = self.compression_scheduler.get_phase(global_step)
-                        ce = getattr(self, "_last_ce_loss", 0.0)
-                        kl = getattr(self, "_last_kl_loss", 0.0)
-                        logger.info(
-                            f"Step {global_step}/{self.total_steps} | "
-                            f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | "
-                            f"CE: {ce:.4f} | KL: {kl:.4f} | "
-                            f"LR: {lr:.2e} | Compression: {compression_ratio}x | "
-                            f"Phase: {phase+1}/{len(self.training_config.compression_schedule)}"
-                        )
                         if self.use_wandb:
                             import wandb
                             wandb.log({
@@ -161,7 +169,7 @@ class TwoStageTrainer:
                     if global_step % self.training_config.eval_steps == 0:
                         eval_ce, eval_kl = self.evaluate(compression_ratio)
                         eval_total = eval_ce + self.training_config.kl_weight * eval_kl
-                        logger.info(
+                        tqdm.write(
                             f"Eval @ step {global_step}: "
                             f"CE={eval_ce:.4f}, KL={eval_kl:.4f}, "
                             f"total={eval_total:.4f}, "
@@ -182,8 +190,6 @@ class TwoStageTrainer:
                     # Save checkpoint
                     if global_step % self.training_config.save_steps == 0:
                         self._save_checkpoint(global_step, compression_ratio)
-
-            logger.info(f"Epoch {epoch+1} completed. Avg loss: {epoch_loss / max(epoch_steps, 1):.4f}")
 
         # Final save
         self._save_checkpoint(global_step, compression_ratio)
