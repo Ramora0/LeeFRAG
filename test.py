@@ -25,7 +25,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from block_attention import build_block_causal_mask_with_qa
 from collator import RAGCollator
 from config import ModelConfig, QFormerConfig, TrainingConfig
-from dataset import RAGDataset
+from dataset import create_dataset
 from kv_cache_utils import (
     apply_rope_to_cache,
     concat_compressed_caches,
@@ -207,6 +207,7 @@ def run_tests(
     checkpoint_path: str,
     max_samples: int = 200,
     compression_ratio_override: int | None = None,
+    dataset_name: str = "rag_v1",
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, tokenizer, qformer, model_config, ckpt_compression_ratio = load_checkpoint(
@@ -215,7 +216,8 @@ def run_tests(
     compression_ratio = compression_ratio_override or ckpt_compression_ratio
 
     training_config = TrainingConfig()
-    dataset = RAGDataset(
+    dataset = create_dataset(
+        dataset_name=dataset_name,
         tokenizer=tokenizer,
         model_config=model_config,
         split="eval",
@@ -299,7 +301,7 @@ def run_tests(
     # === Results ===
     logger.info("")
     logger.info("=" * 70)
-    logger.info(f"DIAGNOSTIC RESULTS  (compression={compression_ratio}x, n={n})")
+    logger.info(f"DIAGNOSTIC RESULTS  [{dataset_name}] (compression={compression_ratio}x, n={n})")
     logger.info("=" * 70)
 
     normal_ce = accum["normal"][0] / max(accum["normal"][1], 1)
@@ -378,10 +380,18 @@ if __name__ == "__main__":
         default=None,
         help="Override compression ratio from checkpoint",
     )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="rag_v1",
+        choices=["rag_v1", "hotpotqa"],
+        help="Dataset to run diagnostics on (default: rag_v1)",
+    )
     args = parser.parse_args()
 
     run_tests(
         checkpoint_path=args.checkpoint,
         max_samples=args.max_samples,
         compression_ratio_override=args.compression_ratio,
+        dataset_name=args.dataset,
     )
