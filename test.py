@@ -1,354 +1,125 @@
-"""Baseline evaluation: run frozen LLM with full documents (no Q-Former compression).
+"""Diagnostic tests for Q-Former KV cache compression.
 
-Baselines:
-1. Full causal attention (standard RAG) — absolute ceiling.
-2. Block attention for docs, full attention for Q+A — ceiling given our attention pattern.
-3. Mean-pooled KV at 2x, 4x, 8x, 16x — naive compression floor.
+Loads a trained checkpoint and runs ablations to verify the compressed
+KV prefix is actually contributing to the model's predictions:
+
+1. Normal:        Q-Former compressed prefix (should match training CE)
+2. No prefix:     No KV cache at all (is the LLM answering from parametric knowledge?)
+3. Zero prefix:   Zero-valued KV cache, same shape (is the LLM ignoring the prefix?)
+4. Random prefix: Random KV cache, same shape (is any prefix equally good?)
+5. Shuffled prefix: Layer-shuffled Q-Former output (is per-layer specialization real?)
+
+If tests 2-5 all score similarly to test 1, the Q-Former isn't helping.
+If test 1 is clearly better, the compression is working.
 """
 
-import json
+import argparse
 import logging
 import math
-import os
-from functools import partial
 
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from transformers.cache_utils import DynamicCache
 
-from block_attention import (
-    build_block_causal_mask,
-    build_block_causal_mask_with_qa,
-    build_prefix_causal_mask,
-)
+from block_attention import build_block_causal_mask_with_qa
 from collator import RAGCollator
-from config import ModelConfig, TrainingConfig
+from config import ModelConfig, QFormerConfig, TrainingConfig
 from dataset import RAGDataset
-from kv_cache_utils import build_dynamic_cache
+from kv_cache_utils import (
+    apply_rope_to_cache,
+    concat_compressed_caches,
+    extract_doc_hidden_states,
+)
+from qformer import QFormerKVCompressor
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
 
-CACHE_DIR = "eval_cache"
-MAX_SAMPLES = 1000
 
+def load_checkpoint(checkpoint_path, device):
+    """Load model, tokenizer, and trained Q-Former from a checkpoint."""
+    model_config = ModelConfig()
+    qformer_config = QFormerConfig()
 
-# ---------------------------------------------------------------------------
-# Result caching
-# ---------------------------------------------------------------------------
+    tokenizer = AutoTokenizer.from_pretrained(model_config.model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
-def _cache_path(name: str) -> str:
-    return os.path.join(CACHE_DIR, f"{name}.json")
-
-
-def _load_cache(name: str) -> dict:
-    path = _cache_path(name)
-    if os.path.exists(path):
-        with open(path) as f:
-            return json.load(f)
-    return {}
-
-
-def _save_cache(name: str, cache: dict):
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    with open(_cache_path(name), "w") as f:
-        json.dump(cache, f)
-
-
-# ---------------------------------------------------------------------------
-# Eval loop with caching
-# ---------------------------------------------------------------------------
-
-def eval_loop(name, dataset, model, tokenizer, device, forward_fn, cache_name=None):
-    """Shared eval loop with per-sample result caching.
-
-    forward_fn(model, item, tokenizer, device) -> (loss_sum, n_valid_tokens) or None.
-    Cached results are stored in eval_cache/<cache_name>.json so re-runs skip
-    already-evaluated samples.
-    """
-    if cache_name is None:
-        cache_name = name.lower().replace(" ", "_")
-    cache = _load_cache(cache_name)
-
-    total_loss = 0.0
-    total_tokens = 0
-    num_samples = 0
-    dirty = False
-
-    n = min(len(dataset), MAX_SAMPLES)
-    pbar = tqdm(range(n), desc=name)
-    for idx in pbar:
-        key = str(idx)
-
-        if key in cache:
-            entry = cache[key]
-            if entry is None:
-                continue
-            loss_sum, n_valid = entry["loss_sum"], entry["n_valid"]
-        else:
-            item = dataset[idx]
-            result = forward_fn(model, item, tokenizer, device)
-            if result is None:
-                cache[key] = None
-                dirty = True
-                if dirty and idx % 20 == 0:
-                    _save_cache(cache_name, cache)
-                    dirty = False
-                continue
-            loss_sum, n_valid = result
-            cache[key] = {"loss_sum": loss_sum, "n_valid": n_valid}
-            dirty = True
-            if idx % 20 == 0:
-                _save_cache(cache_name, cache)
-                dirty = False
-
-        total_loss += loss_sum
-        total_tokens += n_valid
-        num_samples += 1
-
-        if total_tokens > 0:
-            avg = total_loss / total_tokens
-            pbar.set_postfix(loss=f"{avg:.4f}", ppl=f"{math.exp(avg):.2f}")
-
-    if dirty:
-        _save_cache(cache_name, cache)
-
-    avg_loss = total_loss / max(total_tokens, 1)
-    ppl = math.exp(avg_loss)
-    return avg_loss, ppl, num_samples, total_tokens
-
-
-# ---------------------------------------------------------------------------
-# Baseline inputs
-# ---------------------------------------------------------------------------
-
-def build_baseline_input(
-    item: dict, tokenizer, max_total_tokens: int = 4096
-) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """Build full input with documents inlined in the user message.
-
-    This is the standard RAG inference format:
-    system + user(docs + answer_mode + question) + assistant(answer)
-    """
-    doc_texts = item["doc_texts"]
-    full_docs = "\n\n".join(doc_texts)
-    user_content = full_docs + item["question_suffix"]
-
-    messages = [
-        {"role": "system", "content": item["system_prompt"]},
-        {"role": "user", "content": user_content},
-    ]
-
-    prompt_text = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
+    model = AutoModelForCausalLM.from_pretrained(
+        model_config.model_name,
+        torch_dtype=torch.float16,
+        device_map="auto",
     )
-    prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
-    answer_ids = item["answer_ids"].tolist()
+    model.eval()
 
-    # Tulu 3 uses <|end_of_text|> (EOS) as the end-of-turn token
-    end_token = tokenizer.eos_token_id
-    full_ids = prompt_ids + answer_ids + [end_token]
+    qformer = QFormerKVCompressor(qformer_config, model_config).to(device)
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    qformer.load_state_dict(ckpt["qformer_state_dict"])
+    qformer.eval()
 
-    if len(full_ids) > max_total_tokens:
-        excess = len(full_ids) - max_total_tokens
-        prompt_ids = prompt_ids[excess:]
-        full_ids = prompt_ids + answer_ids + [end_token]
+    compression_ratio = ckpt.get("compression_ratio", 4)
+    step = ckpt.get("step", -1)
+    logger.info(
+        f"Loaded checkpoint from step {step}, compression_ratio={compression_ratio}"
+    )
 
-    input_ids = torch.tensor(full_ids, dtype=torch.long)
-    labels = torch.full_like(input_ids, -100)
-    answer_start = len(prompt_ids)
-    labels[answer_start:] = input_ids[answer_start:]
-
-    return input_ids, labels
+    return model, tokenizer, qformer, model_config, compression_ratio
 
 
-# ---------------------------------------------------------------------------
-# Forward functions
-# ---------------------------------------------------------------------------
+@torch.no_grad()
+def run_stage_a(model, doc_token_ids, doc_lengths, qa_input_ids, model_config, device):
+    """Stage A: extract per-doc hidden states and teacher logits."""
+    doc_concat = torch.cat(doc_token_ids, dim=0).unsqueeze(0).to(device)
+    full_input = torch.cat([doc_concat, qa_input_ids], dim=1)
 
-def forward_full_causal(model, item, tokenizer, device):
-    """Standard causal attention — all documents in one sequence."""
-    result = build_baseline_input(item, tokenizer)
-    if result is None:
-        return None
-
-    input_ids, labels = result
-    input_ids = input_ids.unsqueeze(0).to(device)
-    labels = labels.unsqueeze(0).to(device)
-
-    with torch.amp.autocast("cuda"):
-        outputs = model(input_ids=input_ids, use_cache=False)
-
-    return _compute_token_loss(outputs.logits, labels)
-
-
-def forward_block_attention(model, item, tokenizer, device):
-    """Block attention for docs, Q+A attends to all docs + causal within itself."""
-    doc_token_ids = item["doc_token_ids"]
-    doc_lengths = [t.shape[0] for t in doc_token_ids]
-
-    if not doc_token_ids or sum(doc_lengths) == 0:
-        return None
-
-    # Build Q+A tokens using the collator logic
-    collator = _get_collator(tokenizer)
-    stage_b_ids, answer_start, answer_end = collator._build_stage_b_tokens(item)
-
-    # Concatenate: [doc0 | doc1 | ... | Q+A]
-    doc_concat = torch.cat(doc_token_ids, dim=0)
-    full_input = torch.cat([doc_concat, stage_b_ids], dim=0).unsqueeze(0).to(device)
-
-    qa_length = stage_b_ids.shape[0]
-
-    # Block-diagonal for docs, Q+A attends to all docs + causal
+    qa_length = qa_input_ids.shape[1]
     attn_mask = build_block_causal_mask_with_qa(
         doc_lengths, qa_length, dtype=torch.float16, device=device
     )
 
-    # Labels: -100 for everything except answer tokens (offset by doc length)
+    outputs = model(
+        input_ids=full_input,
+        attention_mask=attn_mask,
+        output_hidden_states=True,
+        use_cache=False,
+    )
+
+    per_doc_hidden = extract_doc_hidden_states(
+        outputs.hidden_states, doc_lengths, model_config.num_layers
+    )
+
     doc_total = sum(doc_lengths)
-    full_labels = torch.full((full_input.shape[1],), -100, dtype=torch.long, device=device)
-    full_labels[doc_total + answer_start : doc_total + answer_end] = (
-        full_input[0, doc_total + answer_start : doc_total + answer_end]
-    )
-    full_labels = full_labels.unsqueeze(0)
+    teacher_logits = outputs.logits[:, doc_total:, :]
 
-    with torch.amp.autocast("cuda"):
-        outputs = model(
-            input_ids=full_input,
-            attention_mask=attn_mask,
-            use_cache=False,
-        )
-
-    return _compute_token_loss(outputs.logits, full_labels)
+    return per_doc_hidden, teacher_logits
 
 
-def _mean_pool_kv(k, v, compression_ratio):
-    """Mean pool KV tensors along the sequence dimension.
+@torch.no_grad()
+def compress_docs(qformer, doc_hidden_states, compression_ratio, model, model_config):
+    """Run Q-Former compression and apply RoPE. Returns (cache, prefix_len)."""
+    per_doc_compressed = []
+    for doc_hs in doc_hidden_states:
+        compressed = qformer(doc_hs, compression_ratio)
+        per_doc_compressed.append(compressed)
 
-    Args:
-        k, v: [batch, num_kv_heads, seq_len, head_dim]
-        compression_ratio: Pool groups of this many tokens into one.
-
-    Returns:
-        (k_pooled, v_pooled) each [batch, num_kv_heads, num_compressed, head_dim]
-    """
-    b, h, s, d = k.shape
-    num_compressed = max(1, s // compression_ratio)
-
-    if s <= compression_ratio:
-        # Fewer tokens than ratio — collapse to a single token
-        return k.mean(dim=2, keepdim=True), v.mean(dim=2, keepdim=True)
-
-    # Truncate to evenly divisible length, then reshape and average
-    usable = num_compressed * compression_ratio
-    k_pooled = k[:, :, :usable, :].reshape(b, h, num_compressed, compression_ratio, d).mean(dim=3)
-    v_pooled = v[:, :, :usable, :].reshape(b, h, num_compressed, compression_ratio, d).mean(dim=3)
-    return k_pooled, v_pooled
-
-
-def forward_mean_pool(model, item, tokenizer, device, compression_ratio):
-    """Mean-pool KV baseline: run docs to get KV caches, pool, use as prefix.
-
-    This is a naive compression baseline — mean-pooling mixes positional
-    information (RoPE is already baked into K) and discards fine-grained
-    token-level structure. Should serve as a floor that Q-Former beats.
-    """
-    doc_token_ids = item["doc_token_ids"]
-    doc_lengths = [t.shape[0] for t in doc_token_ids]
-
-    if not doc_token_ids or sum(doc_lengths) == 0:
-        return None
-
-    # Build Q+A tokens
-    collator = _get_collator(tokenizer)
-    stage_b_ids, answer_start, answer_end = collator._build_stage_b_tokens(item)
-
-    # --- Run docs through model with block attention to get KV caches ---
-    doc_concat = torch.cat(doc_token_ids, dim=0).unsqueeze(0).to(device)
-    doc_attn_mask = build_block_causal_mask(
-        doc_lengths, dtype=torch.float16, device=device
+    compressed_cache = concat_compressed_caches(
+        per_doc_compressed, model_config.num_layers
     )
 
-    with torch.amp.autocast("cuda"):
-        doc_outputs = model(
-            input_ids=doc_concat,
-            attention_mask=doc_attn_mask,
-            use_cache=True,
-        )
-
-    full_kv = doc_outputs.past_key_values  # DynamicCache with all doc tokens
-    num_layers = len(full_kv.key_cache)
-
-    # --- Slice per-doc and mean-pool ---
-    pooled_kv_pairs = []  # per layer: (k_concat, v_concat)
-    for layer_idx in range(num_layers):
-        full_k = full_kv.key_cache[layer_idx]  # [1, heads, total_doc_len, dim]
-        full_v = full_kv.value_cache[layer_idx]
-
-        doc_k_parts = []
-        doc_v_parts = []
-        offset = 0
-        for doc_len in doc_lengths:
-            k_slice = full_k[:, :, offset:offset + doc_len, :]
-            v_slice = full_v[:, :, offset:offset + doc_len, :]
-            k_pooled, v_pooled = _mean_pool_kv(k_slice, v_slice, compression_ratio)
-            doc_k_parts.append(k_pooled)
-            doc_v_parts.append(v_pooled)
-            offset += doc_len
-
-        # Concatenate all docs for this layer
-        pooled_kv_pairs.append((
-            torch.cat(doc_k_parts, dim=2),
-            torch.cat(doc_v_parts, dim=2),
-        ))
-
-    # Build DynamicCache from pooled KV
-    compressed_cache = build_dynamic_cache(pooled_kv_pairs)
-
-    # --- Run Q+A with pooled prefix ---
-    prefix_length = compressed_cache.get_seq_length()
-    stage_b_ids = stage_b_ids.unsqueeze(0).to(device)
-    seq_length = stage_b_ids.shape[1]
-
-    attn_mask = build_prefix_causal_mask(
-        prefix_length, seq_length, dtype=torch.float16, device=device
+    rotary_emb = model.model.rotary_emb
+    compressed_cache = apply_rope_to_cache(
+        compressed_cache, model_config.num_layers, rotary_emb
     )
 
-    with torch.amp.autocast("cuda"):
-        outputs = model(
-            input_ids=stage_b_ids,
-            attention_mask=attn_mask,
-            past_key_values=compressed_cache,
-            use_cache=False,
-        )
-
-    # Labels: only answer tokens
-    full_labels = torch.full((seq_length,), -100, dtype=torch.long, device=device)
-    full_labels[answer_start:answer_end] = stage_b_ids[0, answer_start:answer_end]
-    full_labels = full_labels.unsqueeze(0)
-
-    return _compute_token_loss(outputs.logits, full_labels)
+    prefix_len = compressed_cache.get_seq_length()
+    return compressed_cache, prefix_len
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-_collator_cache = {}
-
-
-def _get_collator(tokenizer):
-    tid = id(tokenizer)
-    if tid not in _collator_cache:
-        _collator_cache[tid] = RAGCollator(tokenizer)
-    return _collator_cache[tid]
-
-
-def _compute_token_loss(logits, labels):
-    """Compute per-token loss, return (loss_sum, n_valid_tokens)."""
+def compute_ce(logits, labels):
+    """Compute CE loss on answer tokens. Returns (loss, n_tokens) or None."""
     shift_logits = logits[:, :-1, :].contiguous()
     shift_labels = labels[:, 1:].contiguous()
 
@@ -367,29 +138,79 @@ def _compute_token_loss(logits, labels):
     return loss_per_token[valid_mask].sum().item(), n_valid
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+def forward_with_cache(model, input_ids, labels, past_key_values):
+    """Run LLM forward with a given KV cache prefix."""
+    with torch.amp.autocast("cuda"):
+        outputs = model(
+            input_ids=input_ids,
+            past_key_values=past_key_values,
+            use_cache=False,
+        )
+    return compute_ce(outputs.logits, labels)
+
+
+def forward_no_prefix(model, input_ids, labels):
+    """Run LLM forward with no prefix at all."""
+    with torch.amp.autocast("cuda"):
+        outputs = model(input_ids=input_ids, use_cache=False)
+    return compute_ce(outputs.logits, labels)
+
+
+def make_zero_cache(compressed_cache, num_layers):
+    """Replace all K/V in the cache with zeros."""
+    from transformers.cache_utils import DynamicCache
+    from kv_cache_utils import build_dynamic_cache
+
+    pairs = []
+    for layer_idx in range(num_layers):
+        k = compressed_cache.layers[layer_idx].keys
+        v = compressed_cache.layers[layer_idx].values
+        pairs.append((torch.zeros_like(k), torch.zeros_like(v)))
+    return build_dynamic_cache(pairs)
+
+
+def make_random_cache(compressed_cache, num_layers):
+    """Replace all K/V in the cache with random values matching the scale."""
+    from kv_cache_utils import build_dynamic_cache
+
+    pairs = []
+    for layer_idx in range(num_layers):
+        k = compressed_cache.layers[layer_idx].keys
+        v = compressed_cache.layers[layer_idx].values
+        pairs.append((
+            torch.randn_like(k) * k.std(),
+            torch.randn_like(v) * v.std(),
+        ))
+    return build_dynamic_cache(pairs)
+
+
+def make_shuffled_cache(compressed_cache, num_layers):
+    """Shuffle the layer assignment of the Q-Former output KVs."""
+    from kv_cache_utils import build_dynamic_cache
+
+    perm = torch.randperm(num_layers)
+    pairs = []
+    for layer_idx in range(num_layers):
+        src = perm[layer_idx].item()
+        k = compressed_cache.layers[src].keys
+        v = compressed_cache.layers[src].values
+        pairs.append((k.clone(), v.clone()))
+    return build_dynamic_cache(pairs)
+
 
 @torch.no_grad()
-def evaluate_baseline():
-    model_config = ModelConfig()
-    training_config = TrainingConfig()
-
-    logger.info(f"Loading tokenizer from {model_config.model_name}")
-    tokenizer = AutoTokenizer.from_pretrained(model_config.model_name)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    logger.info(f"Loading model from {model_config.model_name}")
-    model = AutoModelForCausalLM.from_pretrained(
-        model_config.model_name,
-        torch_dtype=torch.float16,
-        device_map="auto",
+def run_tests(
+    checkpoint_path: str,
+    max_samples: int = 200,
+    compression_ratio_override: int | None = None,
+):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model, tokenizer, qformer, model_config, ckpt_compression_ratio = load_checkpoint(
+        checkpoint_path, device
     )
-    model.eval()
+    compression_ratio = compression_ratio_override or ckpt_compression_ratio
 
-    logger.info("Loading eval dataset")
+    training_config = TrainingConfig()
     dataset = RAGDataset(
         tokenizer=tokenizer,
         model_config=model_config,
@@ -397,66 +218,166 @@ def evaluate_baseline():
         eval_split_ratio=training_config.eval_split_ratio,
         seed=training_config.seed,
     )
+    collator = RAGCollator(tokenizer)
 
-    device = next(model.parameters()).device
+    # Accumulators: {test_name: (loss_sum, n_tokens)}
+    tests = ["normal", "no_prefix", "zero_prefix", "random_prefix", "shuffled_layers"]
+    accum = {t: [0.0, 0] for t in tests}
 
-    results = {}
+    n = min(len(dataset), max_samples)
+    pbar = tqdm(range(n), desc=f"Diagnostics @ {compression_ratio}x")
 
-    # === Baseline 1: Full causal attention ===
-    causal_loss, causal_ppl, causal_n, causal_tok = eval_loop(
-        "Full Causal", dataset, model, tokenizer, device,
-        forward_full_causal, cache_name="full_causal",
-    )
-    results["full_causal"] = {"loss": causal_loss, "ppl": causal_ppl}
+    for idx in pbar:
+        item = dataset[idx]
+        batch = collator([item])
 
-    # === Baseline 2: Block attention ===
-    block_loss, block_ppl, block_n, block_tok = eval_loop(
-        "Block Attention", dataset, model, tokenizer, device,
-        forward_block_attention, cache_name="block_attention",
-    )
-    results["block_attention"] = {"loss": block_loss, "ppl": block_ppl}
+        doc_token_ids = batch["doc_token_ids"]
+        doc_lengths = batch["doc_lengths"]
+        stage_b_input_ids = batch["stage_b_input_ids"].to(device)
+        stage_b_labels = batch["stage_b_labels"].to(device)
 
-    # === Mean-pooled KV baselines at various compression ratios ===
-    compression_ratios = [2, 4, 8, 16]
-    pool_results = {}
-    for ratio in compression_ratios:
-        name = f"Mean Pool {ratio}x"
-        cache_name = f"mean_pool_{ratio}x"
-        forward_fn = partial(forward_mean_pool, compression_ratio=ratio)
-        loss, ppl, n_samples, n_tokens = eval_loop(
-            name, dataset, model, tokenizer, device,
-            forward_fn, cache_name=cache_name,
+        if not doc_token_ids or sum(doc_lengths) == 0:
+            continue
+
+        # Stage A
+        doc_hidden_states, teacher_logits = run_stage_a(
+            model, doc_token_ids, doc_lengths, stage_b_input_ids, model_config, device
         )
-        pool_results[ratio] = {"loss": loss, "ppl": ppl, "n": n_samples, "tok": n_tokens}
-        results[f"mean_pool_{ratio}x"] = {"loss": loss, "ppl": ppl}
+
+        # Compress with trained Q-Former
+        compressed_cache, prefix_len = compress_docs(
+            qformer, doc_hidden_states, compression_ratio, model, model_config
+        )
+
+        # --- Test 1: Normal (trained Q-Former) ---
+        result = forward_with_cache(model, stage_b_input_ids, stage_b_labels, compressed_cache)
+        if result is None:
+            continue
+        accum["normal"][0] += result[0]
+        accum["normal"][1] += result[1]
+
+        # --- Test 2: No prefix at all ---
+        result = forward_no_prefix(model, stage_b_input_ids, stage_b_labels)
+        if result:
+            accum["no_prefix"][0] += result[0]
+            accum["no_prefix"][1] += result[1]
+
+        # --- Test 3: Zero prefix ---
+        zero_cache = make_zero_cache(compressed_cache, model_config.num_layers)
+        result = forward_with_cache(model, stage_b_input_ids, stage_b_labels, zero_cache)
+        if result:
+            accum["zero_prefix"][0] += result[0]
+            accum["zero_prefix"][1] += result[1]
+
+        # --- Test 4: Random prefix ---
+        random_cache = make_random_cache(compressed_cache, model_config.num_layers)
+        result = forward_with_cache(model, stage_b_input_ids, stage_b_labels, random_cache)
+        if result:
+            accum["random_prefix"][0] += result[0]
+            accum["random_prefix"][1] += result[1]
+
+        # --- Test 5: Shuffled layers ---
+        shuffled_cache = make_shuffled_cache(compressed_cache, model_config.num_layers)
+        result = forward_with_cache(model, stage_b_input_ids, stage_b_labels, shuffled_cache)
+        if result:
+            accum["shuffled_layers"][0] += result[0]
+            accum["shuffled_layers"][1] += result[1]
+
+        # Update progress bar with running normal CE
+        if accum["normal"][1] > 0:
+            avg_normal = accum["normal"][0] / accum["normal"][1]
+            avg_none = accum["no_prefix"][0] / max(accum["no_prefix"][1], 1)
+            pbar.set_postfix(
+                normal=f"{avg_normal:.3f}",
+                no_pfx=f"{avg_none:.3f}",
+            )
 
     # === Results ===
+    logger.info("")
     logger.info("=" * 70)
-    logger.info("BASELINE RESULTS")
-    logger.info("=" * 70)
-    logger.info(
-        f"  Full Causal:     CE={causal_loss:.4f}  PPL={causal_ppl:.2f}  "
-        f"({causal_n} samples, {causal_tok} tokens)"
-    )
-    logger.info(
-        f"  Block Attention: CE={block_loss:.4f}  PPL={block_ppl:.2f}  "
-        f"({block_n} samples, {block_tok} tokens)"
-    )
-    delta = block_loss - causal_loss
-    logger.info(f"  Block attn overhead: +{delta:.4f} CE ({delta/causal_loss*100:.1f}%)")
-    logger.info("-" * 70)
-    for ratio in compression_ratios:
-        r = pool_results[ratio]
-        delta_from_block = r["loss"] - block_loss
-        logger.info(
-            f"  Mean Pool {ratio:2d}x:   CE={r['loss']:.4f}  PPL={r['ppl']:.2f}  "
-            f"(+{delta_from_block:.4f} vs block)  "
-            f"({r['n']} samples, {r['tok']} tokens)"
-        )
+    logger.info(f"DIAGNOSTIC RESULTS  (compression={compression_ratio}x, n={n})")
     logger.info("=" * 70)
 
-    return results
+    normal_ce = accum["normal"][0] / max(accum["normal"][1], 1)
+
+    labels = {
+        "normal": "Normal (Q-Former)",
+        "no_prefix": "No prefix",
+        "zero_prefix": "Zero prefix",
+        "random_prefix": "Random prefix",
+        "shuffled_layers": "Shuffled layers",
+    }
+
+    for test in tests:
+        loss_sum, n_tok = accum[test]
+        if n_tok == 0:
+            logger.info(f"  {labels[test]:20s}  --no valid tokens--")
+            continue
+        ce = loss_sum / n_tok
+        ppl = math.exp(ce)
+        delta = ce - normal_ce
+        sign = "+" if delta >= 0 else ""
+        logger.info(
+            f"  {labels[test]:20s}  CE={ce:.4f}  PPL={ppl:.2f}  ({sign}{delta:.4f})"
+        )
+
+    logger.info("=" * 70)
+    logger.info("")
+
+    # Interpretation
+    no_prefix_ce = accum["no_prefix"][0] / max(accum["no_prefix"][1], 1)
+    gap = no_prefix_ce - normal_ce
+
+    if gap < 0.05:
+        logger.warning(
+            "!! Normal and no-prefix CE are nearly identical (gap=%.4f). "
+            "The LLM is likely answering from parametric knowledge or the "
+            "question alone. The compressed prefix is NOT contributing.", gap
+        )
+    elif gap < 0.2:
+        logger.warning(
+            "Marginal gap (%.4f) between normal and no-prefix. "
+            "The prefix is helping slightly but the task may be too easy.", gap
+        )
+    else:
+        logger.info(
+            "Good gap (%.4f) between normal and no-prefix. "
+            "The compressed prefix is contributing meaningful information.", gap
+        )
+
+    random_ce = accum["random_prefix"][0] / max(accum["random_prefix"][1], 1)
+    if abs(random_ce - normal_ce) < 0.05:
+        logger.warning(
+            "!! Random prefix scores nearly the same as trained Q-Former. "
+            "The model may not be using the prefix content."
+        )
+
+    return {t: accum[t][0] / max(accum[t][1], 1) for t in tests}
 
 
 if __name__ == "__main__":
-    evaluate_baseline()
+    parser = argparse.ArgumentParser(description="Diagnostic tests for Q-Former compression")
+    parser.add_argument(
+        "checkpoint",
+        type=str,
+        help="Path to checkpoint file (e.g., outputs/checkpoint-500/checkpoint.pt)",
+    )
+    parser.add_argument(
+        "--max_samples",
+        type=int,
+        default=200,
+        help="Max eval samples (default: 200)",
+    )
+    parser.add_argument(
+        "--compression_ratio",
+        type=int,
+        default=None,
+        help="Override compression ratio from checkpoint",
+    )
+    args = parser.parse_args()
+
+    run_tests(
+        checkpoint_path=args.checkpoint,
+        max_samples=args.max_samples,
+        compression_ratio_override=args.compression_ratio,
+    )
