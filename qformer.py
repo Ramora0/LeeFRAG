@@ -25,121 +25,86 @@ class SwiGLU(nn.Module):
 def _build_windowed_cross_attn_mask(
     num_queries: int,
     kv_len: int,
-    layers_per_group: int,
     dtype: torch.dtype,
     device: torch.device | str,
 ) -> torch.Tensor:
     """Build a mask where each query attends only to its local window of inputs.
 
-    The kv sequence is layers_per_group concatenated copies of doc_len tokens.
-    Within each layer copy, query i attends to input tokens
-    [i * stride, i * stride + window_size) where stride = doc_len / num_queries.
-
-    The mask is applied identically across all layer copies.
-
     Args:
         num_queries: Number of query tokens.
-        kv_len: Total KV length (layers_per_group * doc_len).
-        layers_per_group: How many layer copies are concatenated.
+        kv_len: Document length.
         dtype: Mask dtype.
         device: Target device.
 
     Returns:
         mask: [1, 1, num_queries, kv_len]  (0.0 = attend, -inf = masked)
     """
-    doc_len = kv_len // layers_per_group
-    stride = doc_len / num_queries
-    # Window size: at least stride, rounded up, so windows tile with overlap
+    stride = kv_len / num_queries
     window_size = math.ceil(stride) + 1
 
-    # Build mask for one layer copy [num_queries, doc_len]
     q_idx = torch.arange(num_queries, device=device).unsqueeze(1)  # [Q, 1]
-    kv_idx = torch.arange(doc_len, device=device).unsqueeze(0)     # [1, D]
+    kv_idx = torch.arange(kv_len, device=device).unsqueeze(0)      # [1, D]
 
-    # Center of each query's window
     centers = q_idx.float() * stride + stride / 2  # [Q, 1]
     half_win = window_size / 2
 
-    # Query i attends to kv positions within its window
     in_window = (kv_idx.float() >= (centers - half_win)) & (kv_idx.float() < (centers + half_win))
-    layer_mask = torch.where(in_window, 0.0, float("-inf")).to(dtype=dtype)  # [Q, D]
-
-    # Tile across all layer copies
-    mask = layer_mask.repeat(1, layers_per_group)  # [Q, kv_len]
-    return mask.unsqueeze(0).unsqueeze(0)  # [1, 1, Q, kv_len]
+    mask = torch.where(in_window, 0.0, float("-inf")).to(dtype=dtype)  # [Q, D]
+    return mask.unsqueeze(0).unsqueeze(0)  # [1, 1, Q, D]
 
 
-class QFormerLayer(nn.Module):
-    """Single Q-Former layer responsible for one group of LLM layers.
+class QFormerTrunk(nn.Module):
+    """Shared trunk: self-attention among queries, cross-attention to hidden states, FFN.
 
-    1. Self-attention among query tokens
-    2. Cross-attention to hidden states from `layers_per_group` LLM layers
-       - "global": each query attends to all inputs
-       - "windowed": each query attends to its local window
-    3. SwiGLU FFN
-    4. Output K/V projections for each LLM layer in the group
+    Cross-attention is asymmetric: queries at hidden_size, keys/values
+    projected directly from LLM hidden_size (4096) — no premature bottleneck.
     """
 
     def __init__(self, config: QFormerConfig, model_config: ModelConfig):
         super().__init__()
         self.config = config
-        self.model_config = model_config
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = self.hidden_size // self.num_heads
-        self.layers_per_group = config.layers_per_group
-        self.cross_attn_mode = config.cross_attn_mode
 
         # Layer norms (pre-norm architecture)
         self.self_attn_ln = nn.LayerNorm(self.hidden_size)
         self.cross_attn_ln = nn.LayerNorm(self.hidden_size)
-        self.cross_attn_kv_ln = nn.LayerNorm(self.hidden_size)
+        self.cross_attn_kv_ln = nn.LayerNorm(model_config.hidden_size)
         self.ffn_ln = nn.LayerNorm(self.hidden_size)
 
-        # Self-attention
+        # Self-attention (at hidden_size)
         self.self_q = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
         self.self_k = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
         self.self_v = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
         self.self_o = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
         self.self_attn_dropout = nn.Dropout(config.dropout)
 
-        # Cross-attention (queries from Q-Former, keys/values from LLM hidden states)
+        # Cross-attention (asymmetric: queries from hidden_size, K/V from LLM hidden_size)
         self.cross_q = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
-        self.cross_k = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
-        self.cross_v = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+        self.cross_k = nn.Linear(model_config.hidden_size, self.hidden_size, bias=False)
+        self.cross_v = nn.Linear(model_config.hidden_size, self.hidden_size, bias=False)
         self.cross_o = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
         self.cross_attn_dropout = nn.Dropout(config.dropout)
 
         # FFN
         self.ffn = SwiGLU(self.hidden_size, config.ffn_dim, config.dropout)
 
-        # Output projections: produce K and V for each LLM layer in this group
-        kv_dim = model_config.num_kv_heads * model_config.head_dim
-        self.out_k_projs = nn.ModuleList([
-            nn.Linear(self.hidden_size, kv_dim, bias=False)
-            for _ in range(self.layers_per_group)
-        ])
-        self.out_v_projs = nn.ModuleList([
-            nn.Linear(self.hidden_size, kv_dim, bias=False)
-            for _ in range(self.layers_per_group)
-        ])
-
     def forward(
         self,
         query_tokens: torch.Tensor,
-        hidden_states_concat: torch.Tensor,
-    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
         """
         Args:
-            query_tokens: [batch, num_queries, qformer_hidden_size]
-            hidden_states_concat: [batch, layers_per_group * doc_len, qformer_hidden_size]
+            query_tokens: [num_layers, num_queries, hidden_size]
+            hidden_states: [num_layers, doc_len, llm_hidden_size (4096)]
 
         Returns:
-            query_tokens: Updated query tokens [batch, num_queries, qformer_hidden_size]
-            kv_pairs: List of (K, V) for each LLM layer in the group.
-                Each K, V shape: [batch, num_kv_heads, num_queries, head_dim]
+            query_tokens: [num_layers, num_queries, hidden_size]
         """
         batch, num_q, _ = query_tokens.shape
+        hs_len = hidden_states.shape[1]
 
         # 1. Self-attention
         residual = query_tokens
@@ -151,21 +116,18 @@ class QFormerLayer(nn.Module):
         attn_out = attn_out.transpose(1, 2).reshape(batch, num_q, self.hidden_size)
         query_tokens = residual + self.self_attn_dropout(self.self_o(attn_out))
 
-        # 2. Cross-attention to LLM hidden states
+        # 2. Cross-attention (asymmetric: K/V projected from 4096-dim hidden states)
         residual = query_tokens
         x = self.cross_attn_ln(query_tokens)
-        hs_input = self.cross_attn_kv_ln(hidden_states_concat)
-        hs_len = hs_input.shape[1]
+        hs_input = self.cross_attn_kv_ln(hidden_states)
         q = self._reshape_heads(self.cross_q(x), batch, num_q)
         k = self._reshape_heads(self.cross_k(hs_input), batch, hs_len)
         v = self._reshape_heads(self.cross_v(hs_input), batch, hs_len)
 
-        # Build cross-attention mask for windowed mode
         cross_attn_mask = None
-        if self.cross_attn_mode == "windowed":
+        if self.config.cross_attn_mode == "windowed":
             cross_attn_mask = _build_windowed_cross_attn_mask(
-                num_q, hs_len, self.layers_per_group,
-                dtype=q.dtype, device=q.device,
+                num_q, hs_len, dtype=q.dtype, device=q.device,
             )
 
         attn_out = F.scaled_dot_product_attention(
@@ -180,62 +142,117 @@ class QFormerLayer(nn.Module):
         residual = query_tokens
         query_tokens = residual + self.ffn(self.ffn_ln(query_tokens))
 
-        # 4. Output K/V projections for each LLM layer in the group
-        kv_pairs = []
-        for i in range(self.layers_per_group):
-            out_k = self.out_k_projs[i](query_tokens)  # [batch, num_q, kv_dim]
-            out_v = self.out_v_projs[i](query_tokens)
-            # Reshape to [batch, num_kv_heads, num_queries, head_dim]
-            out_k = out_k.view(batch, num_q, self.model_config.num_kv_heads, self.model_config.head_dim).transpose(1, 2)
-            out_v = out_v.view(batch, num_q, self.model_config.num_kv_heads, self.model_config.head_dim).transpose(1, 2)
-            kv_pairs.append((out_k, out_v))
-
-        return query_tokens, kv_pairs
+        return query_tokens
 
     def _reshape_heads(self, x: torch.Tensor, batch: int, seq_len: int) -> torch.Tensor:
         """Reshape [batch, seq, hidden] -> [batch, heads, seq, head_dim]."""
         return x.view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
 
 
+class OutputKVHeads(nn.Module):
+    """Shared base K/V projections + per-layer LoRA deltas.
+
+    W_i = W_shared + A_i @ B_i
+
+    B is initialized to zero so all layers start identical to the shared
+    base and diverge during training.
+    """
+
+    def __init__(self, config: QFormerConfig, model_config: ModelConfig):
+        super().__init__()
+        self.num_layers = model_config.num_layers
+        self.num_kv_heads = model_config.num_kv_heads
+        self.head_dim = model_config.head_dim
+        kv_dim = model_config.num_kv_heads * model_config.head_dim
+        rank = config.lora_rank
+
+        # Shared base projections
+        self.shared_k_proj = nn.Linear(config.hidden_size, kv_dim, bias=False)
+        self.shared_v_proj = nn.Linear(config.hidden_size, kv_dim, bias=False)
+
+        # Per-layer LoRA deltas: A initialized small random, B initialized zero
+        self.lora_k_A = nn.Parameter(torch.randn(model_config.num_layers, config.hidden_size, rank) * 0.01)
+        self.lora_k_B = nn.Parameter(torch.zeros(model_config.num_layers, rank, kv_dim))
+        self.lora_v_A = nn.Parameter(torch.randn(model_config.num_layers, config.hidden_size, rank) * 0.01)
+        self.lora_v_B = nn.Parameter(torch.zeros(model_config.num_layers, rank, kv_dim))
+
+    def forward(self, query_out: torch.Tensor) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Args:
+            query_out: [num_layers, num_queries, hidden_size]
+
+        Returns:
+            List of (K, V) per LLM layer.
+            Each shape: [1, num_kv_heads, num_queries, head_dim]
+        """
+        num_layers, num_q, _ = query_out.shape
+
+        # Shared base: [num_layers, Q, kv_dim]
+        shared_k = self.shared_k_proj(query_out)
+        shared_v = self.shared_v_proj(query_out)
+
+        # Per-layer LoRA deltas via batched matmul: [num_layers, Q, kv_dim]
+        delta_k = torch.bmm(torch.bmm(query_out, self.lora_k_A), self.lora_k_B)
+        delta_v = torch.bmm(torch.bmm(query_out, self.lora_v_A), self.lora_v_B)
+
+        k = shared_k + delta_k
+        v = shared_v + delta_v
+
+        # Reshape to [num_layers, num_kv_heads, Q, head_dim]
+        k = k.view(num_layers, num_q, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.view(num_layers, num_q, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        # Return as list of per-layer (K, V) tuples with batch dim restored
+        return [(k[i : i + 1], v[i : i + 1]) for i in range(num_layers)]
+
+
 class QFormerKVCompressor(nn.Module):
     """Q-Former that compresses per-document hidden states into KV caches.
 
-    Cross-attends to LLM hidden states (4096-dim), then projects to K/V (1024-dim).
+    Architecture: one shared trunk (SA + CA + FFN) processes all LLM layers
+    in a single batched call. Each layer is independent — conditioned only by
+    a learned layer embedding and that layer's hidden states. Cross-attention
+    is asymmetric: K/V are projected directly from 4096-dim LLM hidden states.
+    Output KV heads use shared base projections + per-layer LoRA deltas.
 
-    Query embeddings: A pool of 512 learned embeddings, sliced to
-    doc_len // compression_ratio at runtime. Sinusoidal positional embeddings
-    are added based on each query's relative position in [0, 1], giving
-    the queries a sense of where in the document they correspond to.
-
-    Cross-attention modes:
-    - "global": every query attends to all input hidden states
-    - "windowed": query i attends only to its local stride of input tokens
+    Query embeddings: A single learned content vector broadcast to
+    doc_len // compression_ratio queries at runtime. Sinusoidal positional
+    embeddings differentiate queries by their relative position in [0, 1].
     """
 
     def __init__(self, config: QFormerConfig, model_config: ModelConfig):
         super().__init__()
         self.config = config
         self.model_config = model_config
+        self.num_layers = model_config.num_layers
 
-        # Learned query embeddings (content component)
-        self.query_embeddings = nn.Parameter(
-            torch.randn(1, config.max_query_tokens, config.hidden_size) * 0.02
+        # Single learned query embedding broadcast to num_queries at runtime
+        self.query_embedding = nn.Parameter(
+            torch.randn(1, 1, config.hidden_size) * 0.02
         )
 
-        # Sinusoidal positional embedding frequencies (for relative position encoding)
-        # Precompute inverse frequencies for sin/cos encoding
+        # Sinusoidal positional embedding frequencies
         inv_freq = 1.0 / (10000 ** (torch.arange(0, config.hidden_size, 2).float() / config.hidden_size))
         self.register_buffer("pos_inv_freq", inv_freq)
 
-        # Q-Former layers
-        self.layers = nn.ModuleList([
-            QFormerLayer(config, model_config) for _ in range(config.num_qformer_layers)
-        ])
-
-        # Input projection: LLM hidden_size (4096) → Q-Former hidden_size (1024)
-        self.input_proj = nn.Linear(
-            model_config.hidden_size, config.hidden_size, bias=False
+        # MLP to produce position-dependent query representations from
+        # (learned_embedding + sinusoidal_pos)
+        self.query_init_mlp = nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size, bias=False),
+            nn.SiLU(),
+            nn.Linear(config.hidden_size, config.hidden_size, bias=False),
         )
+
+        # Learned per-layer embeddings for conditioning the shared trunk
+        self.layer_embeddings = nn.Parameter(
+            torch.randn(model_config.num_layers, 1, config.hidden_size) * 0.02
+        )
+
+        # Shared trunk (single batched call for all layers)
+        self.trunk = QFormerTrunk(config, model_config)
+
+        # Shared base + per-layer LoRA output KV heads
+        self.output_heads = OutputKVHeads(config, model_config)
 
         self.gradient_checkpointing = config.gradient_checkpointing
 
@@ -248,7 +265,6 @@ class QFormerKVCompressor(nn.Module):
         Returns: [1, num_queries, hidden_size]
         """
         positions = torch.linspace(0, 1, num_queries, device=device).unsqueeze(1)  # [Q, 1]
-        # Scale positions to a reasonable range for sin/cos
         angles = positions * self.pos_inv_freq.unsqueeze(0) * 2 * math.pi  # [Q, D/2]
         pos_emb = torch.cat([angles.sin(), angles.cos()], dim=-1)  # [Q, D]
         return pos_emb.unsqueeze(0)  # [1, Q, D]
@@ -260,49 +276,41 @@ class QFormerKVCompressor(nn.Module):
     ) -> list[tuple[torch.Tensor, torch.Tensor]]:
         """Compress a single document's hidden states into KV caches.
 
+        Each LLM layer is compressed independently via a shared trunk
+        conditioned on a per-layer embedding. All layers are batched
+        into a single trunk forward pass.
+
         Args:
             doc_hidden_states: List of hidden states per LLM layer.
-                Each shape: [batch, doc_len, llm_hidden_size (4096)]
+                Each shape: [1, doc_len, llm_hidden_size (4096)]
             compression_ratio: How much to compress (e.g., 4 means doc_len/4 queries).
 
         Returns:
             compressed_kv: List of (key, value) per LLM layer.
-                Each shape: [batch, num_kv_heads, num_queries, head_dim]
+                Each shape: [1, num_kv_heads, num_queries, head_dim]
         """
-        batch = doc_hidden_states[0].shape[0]
         doc_len = doc_hidden_states[0].shape[1]
         num_queries = max(1, doc_len // compression_ratio)
         num_queries = min(num_queries, self.config.max_query_tokens)
 
-        # Slice learned query embeddings + add positional encoding
-        query_content = self.query_embeddings[:, :num_queries, :]
-        query_pos = self._get_query_pos_embeddings(num_queries, query_content.device)
-        query_tokens = (query_content + query_pos).expand(batch, -1, -1)
+        # Base queries: [1, Q, H] — learned content + sinusoidal position → MLP
+        query_pos = self._get_query_pos_embeddings(num_queries, self.query_embedding.device)
+        base_queries = self.query_init_mlp(self.query_embedding + query_pos)
 
-        # Process each group of LLM layers
-        all_kv_pairs = []
-        for group_idx, qformer_layer in enumerate(self.layers):
-            start_layer = group_idx * self.config.layers_per_group
-            end_layer = start_layer + self.config.layers_per_group
+        # Condition with per-layer embeddings: [num_layers, Q, H]
+        conditioned_queries = base_queries + self.layer_embeddings
 
-            # Project and concatenate hidden states from this group's layers
-            group_hs_list = []
-            for layer_idx in range(start_layer, end_layer):
-                hs = doc_hidden_states[layer_idx]  # [batch, doc_len, 4096]
-                hs_proj = self.input_proj(hs)  # [batch, doc_len, 1024]
-                group_hs_list.append(hs_proj)
+        # Stack all layers' hidden states: [num_layers, doc_len, 4096]
+        all_hs = torch.cat(doc_hidden_states, dim=0)
 
-            # [batch, layers_per_group * doc_len, qformer_hidden_size]
-            hs_concat = torch.cat(group_hs_list, dim=1)
+        # Single batched trunk call (layers act as batch dim)
+        if self.gradient_checkpointing and self.training:
+            query_out = checkpoint(
+                self.trunk, conditioned_queries, all_hs,
+                use_reentrant=False,
+            )
+        else:
+            query_out = self.trunk(conditioned_queries, all_hs)
 
-            if self.gradient_checkpointing and self.training:
-                query_tokens, kv_pairs = checkpoint(
-                    qformer_layer, query_tokens, hs_concat,
-                    use_reentrant=False,
-                )
-            else:
-                query_tokens, kv_pairs = qformer_layer(query_tokens, hs_concat)
-
-            all_kv_pairs.extend(kv_pairs)
-
-        return all_kv_pairs
+        # Per-layer output KV projections (shared base + LoRA)
+        return self.output_heads(query_out)

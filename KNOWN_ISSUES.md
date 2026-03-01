@@ -61,8 +61,8 @@ The schedule divides training into 4 equal phases (2x, 4x, 8x, 16x). If the mode
 ### Sequential Q-Former Document Processing
 The Q-Former processes documents one at a time in a loop (`_stage_b`), unlike Stage A which concatenates all documents and uses a block-diagonal causal mask for a single batched forward pass. The Q-Former could similarly concatenate all documents' queries and hidden states into one forward pass with block attention masks on both self-attention and cross-attention, keeping documents independent while enabling GPU parallelism. This would also require handling variable `num_queries` per document (due to different doc lengths).
 
-### RoPE Leaks Absolute Position Into Compressed KV
-The frozen LLM applies RoPE during Stage A, so the hidden states the Q-Former cross-attends to have absolute document position baked in. The Q-Former's output KV projections carry this positional signal into the compressed KV cache. When the decoder attends to the compressed prefix, RoPE is applied again at prefix positions, resulting in double-encoded and mismatched positional information. Ideally, RoPE should be undone on the hidden states entering the Q-Former and re-applied to the output KV caches at their correct prefix positions.
+### ~~RoPE Leaks Absolute Position Into Compressed KV~~ (FIXED)
+**Fixed:** `apply_rope_to_cache()` in `kv_cache_utils.py` now applies the LLM's RoPE to the Q-Former's output K values at prefix positions `[0, prefix_len)` before Stage B. The Q-Former outputs raw (un-rotated) K/V, then RoPE is applied to K using the model's own `rotary_emb`, matching what the LLM expects from a normal KV cache. V is left as-is (LLaMA never rotates V). Note: the hidden states fed to the Q-Former are residual-stream outputs, not Q/K projections, so they don't carry direct RoPE rotations — only implicit positional signal through attention patterns.
 
 ### Single-Document Compression
 Each document is compressed independently. Cross-document information (redundancy, contradictions) is not exploited during compression. Two documents saying the same thing produce two separate compressed caches rather than being deduplicated.
@@ -93,10 +93,9 @@ The cosine LR schedule spans all 4 epochs continuously. When the compression rat
 ### Gradient Accumulation Across Compression Boundaries
 If a compression ratio change happens mid-accumulation (e.g., step 5775 of 5775 switches from 2x to 4x), the accumulated gradients mix signals from two different compression levels. This is a minor issue but could cause instability at phase boundaries.
 
-## Deployment
 
-### No Inference Script
-There's no script to actually USE the trained Q-Former for inference (pre-compute compressed caches, load them, generate answers). `test.py` only evaluates the baseline.
-
-### Q-Former Must Match Architecture
-The Q-Former checkpoint is tightly coupled to the frozen LLM's architecture (32 layers, 8 KV heads, 128 head dim, 4096 hidden). It cannot be transferred to a different model without retraining.
+- mean pool init
+- ~~Proper ROPE~~ (done)
+- No self attention??
+- Per layer
+- query init

@@ -35,10 +35,10 @@ def parse_args():
     parser.add_argument("--num_epochs", type=int, default=4)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
-    parser.add_argument("--eval_steps", type=int, default=200)
+    parser.add_argument("--eval_steps", type=int, default=None, help="Eval every N steps (default: 3x per epoch)")
     parser.add_argument("--save_steps", type=int, default=500)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--use_wandb", action="store_true")
+    parser.add_argument("--no_wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument("--gradient_checkpoint_llm", action="store_true")
     parser.add_argument("--offload_stage_a_to_cpu", action="store_true")
     parser.add_argument("--kl_weight", type=float, default=1.0, help="Weight for KL divergence loss")
@@ -61,7 +61,7 @@ def main():
         eval_steps=args.eval_steps,
         save_steps=args.save_steps,
         seed=args.seed,
-        use_wandb=args.use_wandb,
+        use_wandb=not args.no_wandb,
         gradient_checkpoint_llm=args.gradient_checkpoint_llm,
         offload_stage_a_to_cpu=args.offload_stage_a_to_cpu,
         kl_weight=args.kl_weight,

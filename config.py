@@ -18,11 +18,10 @@ class ModelConfig:
 
 @dataclass
 class QFormerConfig:
-    num_qformer_layers: int = 8
-    layers_per_group: int = 4  # 8 * 4 = 32 LLM layers
-    hidden_size: int = 1024  # 8 kv_heads * 128 head_dim
+    hidden_size: int = 1024
     num_attention_heads: int = 8
     ffn_dim: int = 2048
+    lora_rank: int = 32
     dropout: float = 0.1
     max_query_tokens: int = 512
     cross_attn_mode: str = "global"  # "global" or "windowed"
@@ -43,7 +42,7 @@ class TrainingConfig:
     max_grad_norm: float = 1.0
     compression_schedule: list[int] = field(default_factory=lambda: [2, 4, 8, 16])
     eval_split_ratio: float = 0.1
-    eval_steps: int = 200
+    eval_steps: int = None  # auto: steps_per_epoch // 3
     save_steps: int = 500
     logging_steps: int = 10
     seed: int = 42

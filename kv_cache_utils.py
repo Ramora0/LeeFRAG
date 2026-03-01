@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 from transformers.cache_utils import DynamicCache
 
 
@@ -50,6 +51,49 @@ def build_dynamic_cache(
     cache = DynamicCache()
     for layer_idx, (k, v) in enumerate(kv_pairs):
         cache.update(k, v, layer_idx)
+    return cache
+
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rope_to_cache(
+    cache: DynamicCache,
+    num_layers: int,
+    rotary_emb: nn.Module,
+) -> DynamicCache:
+    """Apply RoPE to K values in the compressed cache at positions [0, prefix_len).
+
+    The Q-Former outputs K/V without RoPE. The downstream LLM expects cached K
+    to already have RoPE applied (as it would during normal autoregressive
+    decoding where K is rotated before being stored). V is never RoPE'd.
+
+    Args:
+        cache: DynamicCache with compressed K/V from Q-Former.
+        num_layers: Number of LLM layers.
+        rotary_emb: The LLM's LlamaRotaryEmbedding module.
+
+    Returns:
+        The same cache with RoPE applied to all K values in-place.
+    """
+    prefix_len = cache.get_seq_length()
+    device = cache.key_cache[0].device
+    position_ids = torch.arange(prefix_len, device=device).unsqueeze(0)
+
+    # Get cos/sin from the model's rotary embedding
+    cos, sin = rotary_emb(cache.key_cache[0], position_ids=position_ids)
+    # cos, sin: [1, prefix_len, head_dim]
+    cos = cos.unsqueeze(1)  # [1, 1, prefix_len, head_dim]
+    sin = sin.unsqueeze(1)  # [1, 1, prefix_len, head_dim]
+
+    for layer_idx in range(num_layers):
+        k = cache.key_cache[layer_idx]  # [batch, num_kv_heads, prefix_len, head_dim]
+        cache.key_cache[layer_idx] = (k * cos) + (_rotate_half(k) * sin)
+
     return cache
 
 

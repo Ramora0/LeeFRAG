@@ -13,7 +13,7 @@ from block_attention import (
     build_block_causal_mask_with_qa,
     build_prefix_causal_mask,
 )
-from kv_cache_utils import concat_compressed_caches, extract_doc_hidden_states
+from kv_cache_utils import apply_rope_to_cache, concat_compressed_caches, extract_doc_hidden_states
 from qformer import QFormerKVCompressor
 from scheduler import CompressionScheduler
 
@@ -64,6 +64,10 @@ class TwoStageTrainer:
         self.total_steps = steps_per_epoch * training_config.num_epochs
         self.steps_per_epoch = steps_per_epoch
 
+        # Auto-compute eval_steps: 3 times per epoch if not explicitly set
+        if training_config.eval_steps is None:
+            training_config.eval_steps = max(1, steps_per_epoch // 3)
+
         # LR scheduler
         self.warmup_steps = int(self.total_steps * training_config.warmup_ratio)
 
@@ -94,8 +98,7 @@ class TwoStageTrainer:
         accumulation_count = 0
 
         for epoch in range(self.training_config.num_epochs):
-            epoch_loss = 0.0
-            epoch_steps = 0
+            ema_loss = None
 
             pbar = tqdm(
                 self.train_loader,
@@ -117,7 +120,8 @@ class TwoStageTrainer:
                 self.scaler.scale(loss).backward()
 
                 accumulation_count += 1
-                epoch_loss += loss.item() * self.training_config.gradient_accumulation_steps
+                step_loss = loss.item() * self.training_config.gradient_accumulation_steps
+                ema_loss = step_loss if ema_loss is None else 0.95 * ema_loss + 0.05 * step_loss
 
                 if accumulation_count % self.training_config.gradient_accumulation_steps == 0:
                     # Gradient clipping
@@ -135,16 +139,14 @@ class TwoStageTrainer:
                     self._update_lr(global_step)
 
                     global_step += 1
-                    epoch_steps += 1
 
                     # Update progress bar
-                    avg_loss = epoch_loss / epoch_steps
                     lr = self.optimizer.param_groups[0]["lr"]
                     phase = self.compression_scheduler.get_phase(global_step)
                     ce = getattr(self, "_last_ce_loss", 0.0)
                     kl = getattr(self, "_last_kl_loss", 0.0)
                     pbar.set_postfix(
-                        loss=f"{avg_loss:.4f}",
+                        loss=f"{ema_loss:.4f}",
                         ce=f"{ce:.4f}",
                         kl=f"{kl:.4f}",
                         lr=f"{lr:.2e}",
@@ -156,7 +158,7 @@ class TwoStageTrainer:
                         if self.use_wandb:
                             import wandb
                             wandb.log({
-                                "train/loss": avg_loss,
+                                "train/loss": ema_loss,
                                 "train/ce_loss": ce,
                                 "train/kl_loss": kl,
                                 "train/lr": lr,
@@ -307,6 +309,14 @@ class TwoStageTrainer:
             per_doc_compressed, self.model_config.num_layers
         )
 
+        # Apply RoPE to compressed K values at prefix positions [0, prefix_len)
+        # Q-Former outputs raw K without RoPE; the LLM expects cached K to be
+        # pre-rotated (as it would be during normal autoregressive generation).
+        rotary_emb = self.model.model.rotary_emb
+        compressed_cache = apply_rope_to_cache(
+            compressed_cache, self.model_config.num_layers, rotary_emb
+        )
+
         # Build attention mask for prefix + sequence
         prefix_length = compressed_cache.get_seq_length()
         seq_length = input_ids.shape[1]
@@ -420,7 +430,8 @@ class TwoStageTrainer:
         total_kl = 0.0
         num_batches = 0
 
-        for batch in self.eval_loader:
+        eval_pbar = tqdm(self.eval_loader, desc="Evaluating", leave=False)
+        for batch in eval_pbar:
             doc_token_ids = batch["doc_token_ids"]
             doc_lengths = batch["doc_lengths"]
             stage_b_input_ids = batch["stage_b_input_ids"].to(self.device)
@@ -448,6 +459,12 @@ class TwoStageTrainer:
 
                 compressed_cache = concat_compressed_caches(
                     per_doc_compressed, self.model_config.num_layers
+                )
+
+                # Apply RoPE to compressed K values at prefix positions
+                rotary_emb = self.model.model.rotary_emb
+                compressed_cache = apply_rope_to_cache(
+                    compressed_cache, self.model_config.num_layers, rotary_emb
                 )
 
                 prefix_length = compressed_cache.get_seq_length()
@@ -480,6 +497,10 @@ class TwoStageTrainer:
             total_ce += ce_loss.item()
             total_kl += kl_loss.item()
             num_batches += 1
+            eval_pbar.set_postfix(
+                ce=f"{total_ce / num_batches:.4f}",
+                kl=f"{total_kl / num_batches:.4f}",
+            )
 
         return (
             total_ce / max(num_batches, 1),
