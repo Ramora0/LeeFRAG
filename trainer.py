@@ -78,7 +78,7 @@ class TwoStageTrainer:
         self.use_wandb = training_config.use_wandb
         if self.use_wandb:
             import wandb
-            wandb.init(project="leefrag", config={
+            wandb.init(project="leefrag-kv-compression", config={
                 "model": model_config.__dict__,
                 "qformer": QFormerConfig().__dict__,
                 "training": training_config.__dict__,
@@ -136,9 +136,12 @@ class TwoStageTrainer:
                         avg_loss = epoch_loss / epoch_steps
                         lr = self.optimizer.param_groups[0]["lr"]
                         phase = self.compression_scheduler.get_phase(global_step)
+                        ce = getattr(self, "_last_ce_loss", 0.0)
+                        kl = getattr(self, "_last_kl_loss", 0.0)
                         logger.info(
                             f"Step {global_step}/{self.total_steps} | "
                             f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | "
+                            f"CE: {ce:.4f} | KL: {kl:.4f} | "
                             f"LR: {lr:.2e} | Compression: {compression_ratio}x | "
                             f"Phase: {phase+1}/{len(self.training_config.compression_schedule)}"
                         )
@@ -146,6 +149,8 @@ class TwoStageTrainer:
                             import wandb
                             wandb.log({
                                 "train/loss": avg_loss,
+                                "train/ce_loss": ce,
+                                "train/kl_loss": kl,
                                 "train/lr": lr,
                                 "train/compression_ratio": compression_ratio,
                                 "train/phase": phase,
@@ -154,17 +159,22 @@ class TwoStageTrainer:
 
                     # Evaluation
                     if global_step % self.training_config.eval_steps == 0:
-                        eval_loss = self.evaluate(compression_ratio)
+                        eval_ce, eval_kl = self.evaluate(compression_ratio)
+                        eval_total = eval_ce + self.training_config.kl_weight * eval_kl
                         logger.info(
-                            f"Eval @ step {global_step}: loss={eval_loss:.4f}, "
-                            f"ppl={math.exp(eval_loss):.2f}, "
+                            f"Eval @ step {global_step}: "
+                            f"CE={eval_ce:.4f}, KL={eval_kl:.4f}, "
+                            f"total={eval_total:.4f}, "
+                            f"ppl={math.exp(eval_ce):.2f}, "
                             f"compression={compression_ratio}x"
                         )
                         if self.use_wandb:
                             import wandb
                             wandb.log({
-                                "eval/loss": eval_loss,
-                                "eval/perplexity": math.exp(eval_loss),
+                                "eval/ce_loss": eval_ce,
+                                "eval/kl_loss": eval_kl,
+                                "eval/total_loss": eval_total,
+                                "eval/perplexity": math.exp(eval_ce),
                                 "eval/compression_ratio": compression_ratio,
                             })
                         self.qformer.train()
@@ -323,6 +333,11 @@ class TwoStageTrainer:
         kl_loss = self._compute_kl_loss(teacher_logits, student_logits, labels)
 
         total_loss = ce_loss + self.training_config.kl_weight * kl_loss
+
+        # Stash components for logging (detached)
+        self._last_ce_loss = ce_loss.item()
+        self._last_kl_loss = kl_loss.item()
+
         return total_loss
 
     def _compute_kl_loss(
@@ -392,10 +407,11 @@ class TwoStageTrainer:
             param_group["lr"] = self.training_config.learning_rate * lr_scale
 
     @torch.no_grad()
-    def evaluate(self, compression_ratio: int) -> float:
-        """Evaluate on the eval set. Returns average CE loss."""
+    def evaluate(self, compression_ratio: int) -> tuple[float, float]:
+        """Evaluate on the eval set. Returns (avg CE loss, avg KL loss)."""
         self.qformer.eval()
-        total_loss = 0.0
+        total_ce = 0.0
+        total_kl = 0.0
         num_batches = 0
 
         for batch in self.eval_loader:
@@ -408,7 +424,7 @@ class TwoStageTrainer:
                 continue
 
             # Stage A
-            doc_hidden_states, _ = self._stage_a(
+            doc_hidden_states, teacher_logits = self._stage_a(
                 doc_token_ids, doc_lengths, stage_b_input_ids
             )
             if self.training_config.offload_stage_a_to_cpu:
@@ -416,8 +432,8 @@ class TwoStageTrainer:
                     [hs.to(self.device) for hs in doc_hs]
                     for doc_hs in doc_hidden_states
                 ]
+                teacher_logits = teacher_logits.to(self.device)
 
-            # Stage B (no grad, CE only for eval metric)
             with torch.amp.autocast("cuda", enabled=self.training_config.fp16):
                 per_doc_compressed = []
                 for doc_hs in doc_hidden_states:
@@ -442,18 +458,27 @@ class TwoStageTrainer:
                     use_cache=False,
                 )
 
-                shift_logits = outputs.logits[:, :-1, :].contiguous()
+                student_logits = outputs.logits
+                shift_logits = student_logits[:, :-1, :].contiguous()
                 shift_labels = stage_b_labels[:, 1:].contiguous()
-                loss = F.cross_entropy(
+
+                ce_loss = F.cross_entropy(
                     shift_logits.view(-1, shift_logits.size(-1)),
                     shift_labels.view(-1),
                     ignore_index=-100,
                 )
+                kl_loss = self._compute_kl_loss(
+                    teacher_logits, student_logits, stage_b_labels
+                )
 
-            total_loss += loss.item()
+            total_ce += ce_loss.item()
+            total_kl += kl_loss.item()
             num_batches += 1
 
-        return total_loss / max(num_batches, 1)
+        return (
+            total_ce / max(num_batches, 1),
+            total_kl / max(num_batches, 1),
+        )
 
     def _save_checkpoint(self, step: int, compression_ratio: int):
         """Save Q-Former checkpoint."""

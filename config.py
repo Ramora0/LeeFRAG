@@ -49,7 +49,7 @@ class TrainingConfig:
     seed: int = 42
     fp16: bool = True
     dataloader_num_workers: int = 4
-    use_wandb: bool = False
+    use_wandb: bool = True
     kl_weight: float = 1.0  # alpha for KL divergence loss: total = CE + alpha * KL
     kl_top_k: int = 0  # if > 0, compute KL only over top-k teacher logits (memory saving)
     gradient_checkpoint_llm: bool = False
