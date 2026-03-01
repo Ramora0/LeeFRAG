@@ -91,8 +91,9 @@ def build_block_causal_mask_with_qa(
     mask[doc_total:, :doc_total] = 0.0
 
     # Q+A rows: causal within Q+A
-    qa_causal = torch.tril(
-        torch.zeros(qa_length, qa_length, dtype=dtype, device=device)
+    qa_causal = torch.triu(
+        torch.full((qa_length, qa_length), float("-inf"), dtype=dtype, device=device),
+        diagonal=1,
     )
     mask[doc_total:, doc_total:] = qa_causal
 
@@ -128,8 +129,9 @@ def build_prefix_causal_mask(
     # Attend to all prefix tokens
     mask[:, :prefix_length] = 0.0
     # Causal attention among sequence tokens
-    seq_mask = torch.tril(
-        torch.zeros(seq_length, seq_length, dtype=dtype, device=device)
+    seq_mask = torch.triu(
+        torch.full((seq_length, seq_length), float("-inf"), dtype=dtype, device=device),
+        diagonal=1,
     )
     mask[:, prefix_length:] = seq_mask
 
