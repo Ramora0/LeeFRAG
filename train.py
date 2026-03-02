@@ -61,6 +61,8 @@ def parse_args():
     parser.add_argument("--resume_from", type=str, default=None, help="Path to checkpoint to resume from")
     parser.add_argument("--compression_schedule", type=int, nargs="+", default=[1, 2, 4, 8, 16],
                         help="Compression ratio schedule (default: 1 2 4 8 16)")
+    parser.add_argument("--kv_blend_start", type=float, default=0.9,
+                        help="Initial real-KV blend weight during 1x phase (default: 0.9)")
     return parser.parse_args()
 
 
@@ -237,6 +239,7 @@ def main():
         hidden_state_weight=args.hidden_state_weight,
         hidden_state_layers=args.hidden_state_layers,
         compression_schedule=args.compression_schedule,
+        kv_blend_start=args.kv_blend_start,
     )
 
     qformer_config = QFormerConfig(cross_attn_mode=args.cross_attn_mode)
