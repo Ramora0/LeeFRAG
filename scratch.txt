@@ -1,5 +1,4 @@
-python train.py --dataset hotpotqa --compression_schedule 8 --hidden_state_loss --hidden_state_weight 10.0 
+python train.py --dataset hotpotqa --compression_schedule 16 --hidden_state_loss --hidden_state_weight 10.0 
 
-no hidden_state_loss
-no gate
 more attn
+16x
