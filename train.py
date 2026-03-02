@@ -161,49 +161,57 @@ def verify_identity_passthrough(model, qformer, train_loader, model_config, devi
         logger.info(f"  {label}: CE={ce:.4f} (ppl={math.exp(ce):.2f}), KL={kl:.4f}, prefix_len={prefix_len}")
         return ce, kl
 
-    # --- Run all variants ---
-    logger.info("Identity passthrough test (comparing against Stage A teacher):")
+    # Helper: compute CE from logits directly (no model forward)
+    def _ce_from_logits(logits, labels, label):
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
+        ce = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            ignore_index=-100,
+        ).item()
+        n_valid = (shift_labels != -100).sum().item()
+        logger.info(f"  {label}: CE={ce:.4f} (ppl={math.exp(ce):.2f}), n_answer_tokens={n_valid}")
+        return ce
 
-    # 1. REAL KV: use the model's own KV cache from a normal forward pass
-    #    Tests whether past_key_values / DynamicCache mechanism works at all.
+    # --- Run all variants, from baseline.py's approach to train.py's approach ---
+    logger.info("Pipeline diagnostic (same sample, progressively changing approach):")
+    doc_total = sum(block_lengths)
+
+    # 1. SINGLE PASS, FULL CAUSAL — like baseline.py forward_full_causal
+    #    No block mask, no KV cache. This is the ceiling.
+    with torch.amp.autocast("cuda"):
+        out_causal = model(input_ids=full_input, use_cache=False)
+    causal_qa_logits = out_causal.logits[:, doc_total:, :]
+    # Build labels aligned with full_input (same positions as stage_b_labels)
+    full_labels = torch.full((full_input.shape[1],), -100, dtype=torch.long, device=device)
+    full_labels[doc_total:] = stage_b_labels[0]
+    full_labels = full_labels.unsqueeze(0)
+    _ce_from_logits(out_causal.logits, full_labels, "1. SINGLE PASS full causal")
+
+    # 2. SINGLE PASS, BLOCK MASK — like baseline.py forward_block_attention
+    #    Same forward pass as Stage A. CE from those logits directly.
+    _ce_from_logits(outputs_a.logits, full_labels, "2. SINGLE PASS block mask (= Stage A teacher)")
+
+    # 3. TWO-PASS with REAL KV (full causal use_cache) + prefix mask
     doc_input = torch.cat([preamble, doc_concat], dim=1)
     real_outputs = model(input_ids=doc_input, use_cache=True)
     real_cache = real_outputs.past_key_values
-    _eval_cache(real_cache, "REAL KV (use_cache=True, full causal)")
+    _eval_cache(real_cache, "3. TWO-PASS real KV (full causal)")
 
-    # 2. BYPASS: hidden states → frozen RMSNorm → frozen k_proj/v_proj → RoPE
-    #    Tests whether manual KV reconstruction from hidden states is correct.
+    # 4. TWO-PASS BYPASS (block-diag hidden states → RMSNorm+kv_proj → RoPE)
     bypass_cache = _build_cache(bypass_mode=True)
-    _eval_cache(bypass_cache, "BYPASS (no learnable params)")
+    _eval_cache(bypass_cache, "4. TWO-PASS bypass (block-diag hs)")
 
-    # 3. Q-FORMER: normal forward at ratio 1
+    # 5. TWO-PASS Q-FORMER at ratio 1
     qformer_cache = _build_cache(bypass_mode=False)
-    _eval_cache(qformer_cache, "Q-FORMER (ratio 1)")
+    _eval_cache(qformer_cache, "5. TWO-PASS Q-Former (ratio 1)")
 
-    # --- KV comparison: bypass vs Q-Former ---
-    k_cos_sims = []
-    v_cos_sims = []
-    for layer_idx in range(model_config.num_layers):
-        byp_k = bypass_cache.layers[layer_idx].keys.float()
-        byp_v = bypass_cache.layers[layer_idx].values.float()
-        qf_k = qformer_cache.layers[layer_idx].keys.float()
-        qf_v = qformer_cache.layers[layer_idx].values.float()
-        k_cos = F.cosine_similarity(
-            byp_k.reshape(-1, byp_k.shape[-1]),
-            qf_k.reshape(-1, qf_k.shape[-1]), dim=-1,
-        ).mean().item()
-        v_cos = F.cosine_similarity(
-            byp_v.reshape(-1, byp_v.shape[-1]),
-            qf_v.reshape(-1, qf_v.shape[-1]), dim=-1,
-        ).mean().item()
-        k_cos_sims.append(k_cos)
-        v_cos_sims.append(v_cos)
-
-    avg_k_cos = sum(k_cos_sims) / len(k_cos_sims)
-    avg_v_cos = sum(v_cos_sims) / len(v_cos_sims)
-    logger.info(f"  BYPASS vs Q-FORMER KV cosine sim: K={avg_k_cos:.4f}, V={avg_v_cos:.4f}")
-    logger.info(f"  (If BYPASS CE matches baseline, pipeline is correct.)")
-    logger.info(f"  (If BYPASS CE is bad, bug is in extraction/RoPE/cache, not Q-Former.)")
+    logger.info("  ---")
+    logger.info("  If 1→2 is a big jump: block mask hurts this sample a lot")
+    logger.info("  If 2→3 is a big jump: two-pass mechanism is broken")
+    logger.info("  If 3→4 is a big jump: KV reconstruction from hidden states is broken")
+    logger.info("  If 4→5 is a big jump: Q-Former cross-attention is hurting")
 
     qformer.train()
 
