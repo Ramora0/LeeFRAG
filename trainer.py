@@ -451,6 +451,22 @@ class TwoStageTrainer:
             num_queries = compressed[0][0].shape[2]  # [1, num_kv_heads, num_queries, head_dim]
             empirical_ratios.append(doc_len / num_queries)
 
+        # Blend with real KV per-doc before concatenation (only when lengths match)
+        if blend_alpha > 0 and compression_ratio == 1:
+            per_doc_real = self._compute_real_kv_cache(doc_hidden_states)
+            for doc_idx in range(len(per_doc_compressed)):
+                comp_len = per_doc_compressed[doc_idx][0][0].shape[2]
+                real_len = per_doc_real[doc_idx][0][0].shape[2]
+                if comp_len != real_len:
+                    continue  # max_query_tokens capped this doc, skip blend
+                for layer_idx in range(self.model_config.num_layers):
+                    ck, cv = per_doc_compressed[doc_idx][layer_idx]
+                    rk, rv = per_doc_real[doc_idx][layer_idx]
+                    per_doc_compressed[doc_idx][layer_idx] = (
+                        blend_alpha * rk.detach() + (1 - blend_alpha) * ck,
+                        blend_alpha * rv.detach() + (1 - blend_alpha) * cv,
+                    )
+
         # Concatenate compressed caches from all documents
         compressed_cache = concat_compressed_caches(
             per_doc_compressed, self.model_config.num_layers
@@ -463,27 +479,6 @@ class TwoStageTrainer:
         compressed_cache = apply_rope_to_cache(
             compressed_cache, self.model_config.num_layers, rotary_emb
         )
-
-        # Blend with real KV cache during 1x phase
-        if blend_alpha > 0 and compression_ratio == 1:
-            per_doc_real = self._compute_real_kv_cache(doc_hidden_states)
-            real_cache = concat_compressed_caches(
-                per_doc_real, self.model_config.num_layers
-            )
-            real_cache = apply_rope_to_cache(
-                real_cache, self.model_config.num_layers, rotary_emb
-            )
-            for layer_idx in range(self.model_config.num_layers):
-                real_k = real_cache.layers[layer_idx].keys
-                real_v = real_cache.layers[layer_idx].values
-                comp_k = compressed_cache.layers[layer_idx].keys
-                comp_v = compressed_cache.layers[layer_idx].values
-                compressed_cache.layers[layer_idx].keys = (
-                    blend_alpha * real_k.detach() + (1 - blend_alpha) * comp_k
-                )
-                compressed_cache.layers[layer_idx].values = (
-                    blend_alpha * real_v.detach() + (1 - blend_alpha) * comp_v
-                )
 
         # Forward through frozen LLM with compressed KV prefix
         # No explicit attention_mask: HF generates the correct prefix-causal
