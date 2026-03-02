@@ -65,17 +65,9 @@ def parse_args():
 
 @torch.no_grad()
 def verify_identity_passthrough(model, qformer, train_loader, model_config, device):
-    """Test pipeline correctness with bypass and Q-Former at compression ratio 1.
+    """Quick single-sample sanity check: bypass vs Q-Former at ratio 1.
 
-    Runs two variants:
-      1. BYPASS: Skip cross-attention, pass hidden states directly through
-         frozen RMSNorm + k_proj/v_proj. If this doesn't match baseline,
-         there's a bug in extraction, RoPE, cache assembly, or positions.
-      2. Q-FORMER: Normal Q-Former forward at ratio 1. Compared against
-         bypass to isolate cross-attention's impact.
-
-    Both are compared against teacher logits from Stage A (block-diagonal),
-    which is the actual training target.
+    For a full multi-sample pipeline diagnostic, run: python test.py pipeline
     """
     qformer.eval()
     batch = next(iter(train_loader))
@@ -93,7 +85,7 @@ def verify_identity_passthrough(model, qformer, train_loader, model_config, devi
     preamble_len = preamble_ids.shape[0]
     block_lengths = [preamble_len + doc_lengths[0]] + doc_lengths[1:]
 
-    # --- Stage A: get hidden states + teacher logits ---
+    # Stage A: get hidden states
     doc_concat = torch.cat(doc_token_ids, dim=0).unsqueeze(0).to(device)
     preamble = preamble_ids.unsqueeze(0).to(device)
     full_input = torch.cat([preamble, doc_concat, stage_b_input_ids], dim=1)
@@ -109,11 +101,9 @@ def verify_identity_passthrough(model, qformer, train_loader, model_config, devi
     per_doc_hidden = extract_doc_hidden_states(
         outputs_a.hidden_states, block_lengths, model_config.num_layers,
     )
-    teacher_logits = outputs_a.logits[:, sum(block_lengths):, :]
-
     rotary_emb = model.model.rotary_emb
 
-    def _build_cache(bypass_mode):
+    def _build_and_eval(bypass_mode, label):
         with torch.amp.autocast("cuda"):
             per_doc_compressed = [
                 qformer(doc_hs, compression_ratio=1, bypass=bypass_mode)
@@ -121,97 +111,33 @@ def verify_identity_passthrough(model, qformer, train_loader, model_config, devi
             ]
             cache = concat_compressed_caches(per_doc_compressed, model_config.num_layers)
             cache = apply_rope_to_cache(cache, model_config.num_layers, rotary_emb)
-        return cache
 
-    def _eval_cache(cache, label):
         prefix_len = cache.get_seq_length()
-        qa_len = stage_b_input_ids.shape[1]
-        # Must pass explicit 4D prefix-causal mask — HF's auto-generated mask
-        # is wrong when past_key_values is provided with multi-token input + SDPA.
-        attn_mask = build_prefix_causal_mask(
-            prefix_len, qa_len, dtype=torch.float16, device=device,
+        mask = build_prefix_causal_mask(
+            prefix_len, stage_b_input_ids.shape[1],
+            dtype=torch.float16, device=device,
         )
         with torch.amp.autocast("cuda"):
             out = model(
-                input_ids=stage_b_input_ids,
-                past_key_values=cache,
-                attention_mask=attn_mask,
-                use_cache=False,
+                input_ids=stage_b_input_ids, past_key_values=cache,
+                attention_mask=mask, use_cache=False,
             )
-        logits = out.logits
-        shift_logits = logits[:, :-1, :].contiguous()
+        shift_logits = out.logits[:, :-1, :].contiguous()
         shift_labels = stage_b_labels[:, 1:].contiguous()
         ce = F.cross_entropy(
             shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1),
-            ignore_index=-100,
-        ).item()
-
-        valid_mask = (shift_labels != -100).view(-1)
-        if valid_mask.any():
-            valid_idx = valid_mask.nonzero(as_tuple=True)[0]
-            t_flat = teacher_logits[:, :-1, :].contiguous().view(-1, teacher_logits.size(-1))[valid_idx]
-            s_flat = shift_logits.view(-1, shift_logits.size(-1))[valid_idx]
-            t_lp = F.log_softmax(t_flat.float(), dim=-1)
-            s_lp = F.log_softmax(s_flat.float(), dim=-1)
-            kl = F.kl_div(s_lp, t_lp, log_target=True, reduction="batchmean").item()
-        else:
-            kl = float("nan")
-
-        logger.info(f"  {label}: CE={ce:.4f} (ppl={math.exp(ce):.2f}), KL={kl:.4f}, prefix_len={prefix_len}")
-        return ce, kl
-
-    # Helper: compute CE from logits directly (no model forward)
-    def _ce_from_logits(logits, labels, label):
-        shift_logits = logits[:, :-1, :].contiguous()
-        shift_labels = labels[:, 1:].contiguous()
-        ce = F.cross_entropy(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1),
-            ignore_index=-100,
+            shift_labels.view(-1), ignore_index=-100,
         ).item()
         n_valid = (shift_labels != -100).sum().item()
-        logger.info(f"  {label}: CE={ce:.4f} (ppl={math.exp(ce):.2f}), n_answer_tokens={n_valid}")
+        logger.info(f"  {label}: CE={ce:.4f} (ppl={math.exp(ce):.2f}), n_tokens={n_valid}")
         return ce
 
-    # --- Run all variants, from baseline.py's approach to train.py's approach ---
-    logger.info("Pipeline diagnostic (same sample, progressively changing approach):")
-    doc_total = sum(block_lengths)
-
-    # 1. SINGLE PASS, FULL CAUSAL — like baseline.py forward_full_causal
-    #    No block mask, no KV cache. This is the ceiling.
-    with torch.amp.autocast("cuda"):
-        out_causal = model(input_ids=full_input, use_cache=False)
-    causal_qa_logits = out_causal.logits[:, doc_total:, :]
-    # Build labels aligned with full_input (same positions as stage_b_labels)
-    full_labels = torch.full((full_input.shape[1],), -100, dtype=torch.long, device=device)
-    full_labels[doc_total:] = stage_b_labels[0]
-    full_labels = full_labels.unsqueeze(0)
-    _ce_from_logits(out_causal.logits, full_labels, "1. SINGLE PASS full causal")
-
-    # 2. SINGLE PASS, BLOCK MASK — like baseline.py forward_block_attention
-    #    Same forward pass as Stage A. CE from those logits directly.
-    _ce_from_logits(outputs_a.logits, full_labels, "2. SINGLE PASS block mask (= Stage A teacher)")
-
-    # 3. TWO-PASS with REAL KV (full causal use_cache) + prefix mask
-    doc_input = torch.cat([preamble, doc_concat], dim=1)
-    real_outputs = model(input_ids=doc_input, use_cache=True)
-    real_cache = real_outputs.past_key_values
-    _eval_cache(real_cache, "3. TWO-PASS real KV (full causal)")
-
-    # 4. TWO-PASS BYPASS (block-diag hidden states → RMSNorm+kv_proj → RoPE)
-    bypass_cache = _build_cache(bypass_mode=True)
-    _eval_cache(bypass_cache, "4. TWO-PASS bypass (block-diag hs)")
-
-    # 5. TWO-PASS Q-FORMER at ratio 1
-    qformer_cache = _build_cache(bypass_mode=False)
-    _eval_cache(qformer_cache, "5. TWO-PASS Q-Former (ratio 1)")
-
-    logger.info("  ---")
-    logger.info("  If 1→2 is a big jump: block mask hurts this sample a lot")
-    logger.info("  If 2→3 is a big jump: two-pass mechanism is broken")
-    logger.info("  If 3→4 is a big jump: KV reconstruction from hidden states is broken")
-    logger.info("  If 4→5 is a big jump: Q-Former cross-attention is hurting")
+    logger.info("Identity passthrough (single sample):")
+    bypass_ce = _build_and_eval(bypass_mode=True, label="Bypass")
+    qformer_ce = _build_and_eval(bypass_mode=False, label="Q-Former")
+    delta = qformer_ce - bypass_ce
+    logger.info(f"  Delta (Q-Former - Bypass): {delta:+.4f}")
+    logger.info("  (For full multi-sample diagnostic: python test.py pipeline)")
 
     qformer.train()
 
