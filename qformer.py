@@ -265,9 +265,6 @@ class QFormerKVCompressor(nn.Module):
         self.model_config = model_config
         self.num_layers = model_config.num_layers
 
-        # RMSNorm before projection (matches LLM's input_layernorm)
-        self.input_norm = nn.RMSNorm(model_config.hidden_size)
-
         # Project mean-pooled hidden states to Q-Former dim
         self.input_proj = nn.Linear(model_config.hidden_size, config.hidden_size, bias=False)
 
@@ -283,95 +280,6 @@ class QFormerKVCompressor(nn.Module):
         self.output_heads = OutputKVHeads(config, model_config)
 
         self.gradient_checkpointing = config.gradient_checkpointing
-
-    def init_from_llm(self, llm: nn.Module):
-        """Initialize input_proj and output heads from the LLM's K/V weights.
-
-        Factorizes the LLM's per-layer K/V projections through the Q-Former's
-        1024-dim bottleneck so the module starts near-identity: at ratio 1
-        the compressed KV cache closely matches the LLM's real KV cache.
-
-        Steps:
-          1. Stack all per-layer k_proj and v_proj weights (both 1024x4096).
-          2. SVD on their concatenation to find the best shared 1024-dim
-             subspace of the 4096-dim hidden states for K/V reconstruction.
-          3. Set input_proj to project into this subspace.
-          4. Solve shared_k/v_proj via least-squares to reconstruct the
-             layer-average K and V projections from the subspace.
-          5. Initialize per-layer LoRA A/B to capture each layer's deviation
-             from the average.
-        """
-        device = self.input_proj.weight.device
-        dtype = self.input_proj.weight.dtype
-
-        # Collect per-layer K/V projection weights with RMSNorm gamma folded in.
-        # LLM computes K = k_proj(RMSNorm(x)) = k_proj(gamma * x / rms(x))
-        # We fold gamma into the weight: W_k_eff = W_k @ diag(gamma)
-        # The 1/rms(x) normalization is input-dependent and handled separately.
-        all_k_weights = []
-        all_v_weights = []
-        for layer in llm.model.layers:
-            gamma = layer.input_layernorm.weight.detach().float()  # [hidden_size]
-            wk = layer.self_attn.k_proj.weight.detach().float()   # [kv_dim, hidden_size]
-            wv = layer.self_attn.v_proj.weight.detach().float()
-            all_k_weights.append(wk * gamma.unsqueeze(0))  # broadcast: [kv_dim, hidden_size]
-            all_v_weights.append(wv * gamma.unsqueeze(0))
-
-        # [num_layers, kv_dim, llm_hidden_size]
-        Wk = torch.stack(all_k_weights)
-        Wv = torch.stack(all_v_weights)
-
-        Wk_avg = Wk.mean(dim=0)  # [kv_dim, llm_hidden_size] = [1024, 4096]
-        Wv_avg = Wv.mean(dim=0)
-
-        # SVD on stacked [Wk_avg; Wv_avg] (2048 x 4096) to find best shared
-        # 1024-dim subspace of the 4096-dim hidden states
-        stacked = torch.cat([Wk_avg, Wv_avg], dim=0)  # [2048, 4096]
-        U, S, Vh = torch.linalg.svd(stacked, full_matrices=False)
-        # Vh[:1024] are the top-1024 right singular vectors: [1024, 4096]
-        # This is the input projection: 4096 -> 1024
-        input_proj_weight = Vh[:self.config.hidden_size]  # [1024, 4096]
-
-        # Solve for shared output projections via least-squares:
-        # shared_k_proj @ input_proj ≈ Wk_avg  =>  shared_k_proj ≈ Wk_avg @ pinv(input_proj)
-        # Since input_proj is [1024, 4096] with full row rank,
-        # pinv = V^T (S^{-1}) U^T in thin SVD, but simpler:
-        # pinv(A) = A^T @ (A @ A^T)^{-1} for full row-rank A
-        # But since input_proj = Vh[:1024] (orthonormal rows), pinv = Vh[:1024]^T
-        input_pinv = input_proj_weight.T  # [4096, 1024] (rows are orthonormal)
-
-        shared_k_weight = Wk_avg @ input_pinv  # [1024, 1024]
-        shared_v_weight = Wv_avg @ input_pinv  # [1024, 1024]
-
-        # Apply to modules
-        self.input_proj.weight.data.copy_(input_proj_weight.to(dtype).to(device))
-        self.output_heads.shared_k_proj.weight.data.copy_(shared_k_weight.to(dtype).to(device))
-        self.output_heads.shared_v_proj.weight.data.copy_(shared_v_weight.to(dtype).to(device))
-
-        # Initialize per-layer LoRA to capture each layer's deviation from avg.
-        # For layer i: W_k_i ≈ (shared_k + A_i @ B_i) @ input_proj
-        # Residual in output space: R_k_i = W_k_i @ input_pinv - shared_k  [1024x1024]
-        # Factor R_k_i ≈ A_i @ B_i via truncated SVD at lora_rank
-        rank = self.config.lora_rank
-        for i in range(self.num_layers):
-            Rk = (all_k_weights[i] @ input_pinv) - shared_k_weight  # [1024, 1024]
-            Rv = (all_v_weights[i] @ input_pinv) - shared_v_weight
-
-            Uk, Sk, Vhk = torch.linalg.svd(Rk, full_matrices=False)
-            Uv, Sv, Vhv = torch.linalg.svd(Rv, full_matrices=False)
-
-            # A: [hidden_size, rank], B: [rank, kv_dim]
-            # R ≈ Uk[:,:r] @ diag(Sk[:r]) @ Vhk[:r,:] = (Uk[:,:r] @ sqrt(S)) @ (sqrt(S) @ Vhk[:r,:])
-            sqrt_Sk = Sk[:rank].sqrt()
-            self.output_heads.lora_k_A.data[i] = (Uk[:, :rank] * sqrt_Sk.unsqueeze(0)).to(dtype).to(device)
-            self.output_heads.lora_k_B.data[i] = (Vhk[:rank, :] * sqrt_Sk.unsqueeze(1)).to(dtype).to(device)
-
-            sqrt_Sv = Sv[:rank].sqrt()
-            self.output_heads.lora_v_A.data[i] = (Uv[:, :rank] * sqrt_Sv.unsqueeze(0)).to(dtype).to(device)
-            self.output_heads.lora_v_B.data[i] = (Vhv[:rank, :] * sqrt_Sv.unsqueeze(1)).to(dtype).to(device)
-
-        # Zero out layer embeddings so they don't perturb the identity at init
-        self.layer_embeddings.data.zero_()
 
     def forward(
         self,
@@ -407,8 +315,8 @@ class QFormerKVCompressor(nn.Module):
             num_queries,
         ).permute(0, 2, 1)  # [num_layers, num_queries, 4096]
 
-        # RMSNorm + project to Q-Former dim: [num_layers, num_queries, hidden_size]
-        queries = self.input_proj(self.input_norm(pooled))
+        # Project to Q-Former dim: [num_layers, num_queries, hidden_size]
+        queries = self.input_proj(pooled)
 
         # Condition with per-layer embeddings
         queries = queries + self.layer_embeddings
