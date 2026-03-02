@@ -132,8 +132,8 @@ def verify_identity_passthrough(model, qformer, train_loader, model_config, devi
 
     for layer_idx in range(model_config.num_layers):
         # Real KV: [batch, num_kv_heads, seq_len, head_dim]
-        real_k = real_cache[layer_idx][0].float()
-        real_v = real_cache[layer_idx][1].float()
+        real_k = real_cache.layers[layer_idx].keys.float()
+        real_v = real_cache.layers[layer_idx].values.float()
         comp_k = compressed_cache.layers[layer_idx].keys.float()
         comp_v = compressed_cache.layers[layer_idx].values.float()
 
