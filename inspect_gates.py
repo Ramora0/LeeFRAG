@@ -19,10 +19,10 @@ def main():
     else:
         state_dict = ckpt
 
-    gate_keys = sorted(k for k in state_dict if "residual_gate" in k)
+    gate_keys = sorted(k for k in state_dict if "gate" in k)
 
     if not gate_keys:
-        print("No residual_gate parameters found in checkpoint.")
+        print("No gate parameters found in checkpoint.")
         print(f"Available keys ({len(state_dict)}):")
         for k in sorted(state_dict):
             print(f"  {k}")
@@ -41,7 +41,7 @@ def main():
     sig_vals = [torch.sigmoid(state_dict[k]).item() for k in gate_keys]
     print(f"\nSigmoid range: [{min(sig_vals):.4f}, {max(sig_vals):.4f}]")
     print(f"Sigmoid mean:  {sum(sig_vals) / len(sig_vals):.4f}")
-    print(f"\nNote: sigmoid(gate) near 0 = identity pass-through, near 1 = full cross-attention")
+    print(f"\nNote: sigmoid near 0 = identity/no-op, near 1 = full effect")
 
 
 if __name__ == "__main__":

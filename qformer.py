@@ -17,11 +17,13 @@ class QFormerKVCompressor(nn.Module):
         3. V-free cross-attention with relative position bias: small Wq/Wk compute
            attention routing weights, raw 4096-dim hidden states are the values (no Wv)
         4. Gated residual: output = gate * cross_attn + (1-gate) * queries
-        5. Frozen copies of the LLM's own k_proj/v_proj produce final KV cache entries
+        5. SwiGLU FFN with gated residual to break the convex hull of input hidden states
+        6. Frozen copies of the LLM's own k_proj/v_proj produce final KV cache entries
 
     At init with compression_ratio=1:
         - Mean-pool is identity (window size 1)
         - Gated residual with gate ≈ 0 → output ≈ queries = original hidden states
+        - FFN residual gate ≈ 0 → FFN is a no-op
         - Frozen KV projections reproduce the LLM's own KV cache
         → output ≈ LLM's real KV cache
     """
@@ -55,8 +57,18 @@ class QFormerKVCompressor(nn.Module):
         # Initialized to favor nearby positions; learned during training
         self.pos_bias_slope = nn.Parameter(torch.tensor(2.0))
 
-        # Gated residual: sigmoid(-5) ≈ 0.007, so output ≈ queries at init
-        self.residual_gate = nn.Parameter(torch.tensor(-5.0))
+        # Gated residual: sigmoid(-4) ≈ 0.018, so output ≈ queries at init
+        self.residual_gate = nn.Parameter(torch.tensor(-4.0))
+
+        # Shared SwiGLU FFN: breaks the convex hull of input hidden states
+        ffn_dim = config.ffn_dim
+        self.ffn_gate = nn.Linear(hidden, ffn_dim, bias=False)
+        self.ffn_up = nn.Linear(hidden, ffn_dim, bias=False)
+        self.ffn_down = nn.Linear(ffn_dim, hidden, bias=False)
+        # Zero-init output so FFN is a no-op at start
+        nn.init.zeros_(self.ffn_down.weight)
+        # FFN gated residual (separate from cross-attn gate)
+        self.ffn_residual_gate = nn.Parameter(torch.tensor(-4.0))
 
         # Frozen per-layer KV projections from the LLM
         # Shape: [num_layers, kv_dim, hidden] (transposed for F.linear)
@@ -131,6 +143,19 @@ class QFormerKVCompressor(nn.Module):
 
         return compressed
 
+    def _ffn(self, x: torch.Tensor) -> torch.Tensor:
+        """Shared SwiGLU FFN with gated residual.
+
+        Args:
+            x: [num_layers, num_queries, 4096]
+
+        Returns:
+            output: [num_layers, num_queries, 4096]
+        """
+        ffn_out = self.ffn_down(F.silu(self.ffn_gate(x)) * self.ffn_up(x))
+        gate = torch.sigmoid(self.ffn_residual_gate)
+        return gate * ffn_out + x
+
     def _apply_frozen_kv_proj(
         self, compressed: torch.Tensor,
     ) -> list[tuple[torch.Tensor, torch.Tensor]]:
@@ -173,7 +198,9 @@ class QFormerKVCompressor(nn.Module):
         layer_emb: torch.Tensor,
     ) -> torch.Tensor:
         """Inner forward for gradient checkpointing."""
-        return self._cross_attend(queries, all_hs, layer_emb)
+        x = self._cross_attend(queries, all_hs, layer_emb)
+        x = self._ffn(x)
+        return x
 
     def forward(
         self,
@@ -222,6 +249,7 @@ class QFormerKVCompressor(nn.Module):
             )
         else:
             compressed = self._cross_attend(pooled, all_hs, self.layer_embeddings)
+            compressed = self._ffn(compressed)
 
         # Apply frozen LLM KV projections
         return self._apply_frozen_kv_proj(compressed)
