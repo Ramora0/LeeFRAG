@@ -202,12 +202,12 @@ def load_checkpoint(checkpoint_path, device):
     model, tokenizer, model_config = load_model(device)
     qformer_config = QFormerConfig()
 
-    qformer = QFormerKVCompressor(qformer_config, model_config).to(device)
+    qformer = QFormerKVCompressor(qformer_config, model_config, llm=model).to(device)
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
 
     state_dict = ckpt["qformer_state_dict"]
     state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
-    qformer.load_state_dict(state_dict)
+    qformer.load_state_dict(state_dict, strict=False)
     qformer.eval()
 
     step = ckpt.get("step", -1)

@@ -18,13 +18,9 @@ class ModelConfig:
 
 @dataclass
 class QFormerConfig:
-    hidden_size: int = 1024
-    num_attention_heads: int = 8
-    ffn_dim: int = 2048
-    lora_rank: int = 32
-    dropout: float = 0.1
+    attn_dim: int = 256  # projection dim for cross-attention routing (small — only computes weights)
+    num_routing_heads: int = 8  # number of heads for attention routing
     max_query_tokens: int = 512
-    cross_attn_mode: str = "global"  # "global" or "windowed"
     gradient_checkpointing: bool = False
 
 

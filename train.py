@@ -57,7 +57,6 @@ def parse_args():
                         help="Weight for hidden state matching loss")
     parser.add_argument("--hidden_state_layers", type=str, default="all",
                         help="Which layers to match: 'all' or 'last_N' (e.g. 'last_8')")
-    parser.add_argument("--cross_attn_mode", type=str, default="global", choices=["global", "windowed"])
     parser.add_argument("--resume_from", type=str, default=None, help="Path to checkpoint to resume from")
     parser.add_argument("--compression_schedule", type=int, nargs="+", default=[1, 2, 4, 8, 16],
                         help="Compression ratio schedule (default: 1 2 4 8 16)")
@@ -242,7 +241,7 @@ def main():
         kv_blend_start=args.kv_blend_start,
     )
 
-    qformer_config = QFormerConfig(cross_attn_mode=args.cross_attn_mode)
+    qformer_config = QFormerConfig()
 
     set_seed(training_config.seed)
     os.makedirs(training_config.output_dir, exist_ok=True)
@@ -269,10 +268,10 @@ def main():
         model.gradient_checkpointing_enable()
         logger.info("Enabled gradient checkpointing for frozen LLM (Stage B)")
 
-    # Build Q-Former
+    # Build Q-Former (pass LLM so frozen KV projections are copied)
     logger.info("Building Q-Former KV compressor")
-    qformer = QFormerKVCompressor(qformer_config, model_config).to(device)
-    qformer.trunk = torch.compile(qformer.trunk, dynamic=True)
+    qformer = QFormerKVCompressor(qformer_config, model_config, llm=model).to(device)
+    qformer._cross_attend = torch.compile(qformer._cross_attend, dynamic=True)
     trainable_params = sum(p.numel() for p in qformer.parameters() if p.requires_grad)
     logger.info(f"Q-Former trainable params: {trainable_params / 1e6:.1f}M")
 
