@@ -14,14 +14,14 @@ class QFormerKVCompressor(nn.Module):
     Architecture:
         1. Mean-pool hidden states at 4096-dim → initial queries
         2. Per-layer learned embeddings condition the shared routing
-        3. V-free cross-attention: small Wq/Wk compute attention routing weights,
-           raw 4096-dim hidden states are the values (no Wv)
-        4. Frozen copies of the LLM's own k_proj/v_proj produce final KV cache entries
+        3. V-free cross-attention with relative position bias: small Wq/Wk compute
+           attention routing weights, raw 4096-dim hidden states are the values (no Wv)
+        4. Gated residual: output = gate * cross_attn + (1-gate) * queries
+        5. Frozen copies of the LLM's own k_proj/v_proj produce final KV cache entries
 
     At init with compression_ratio=1:
         - Mean-pool is identity (window size 1)
-        - Wq and Wk are initialized identically → dot products favor nearby positions
-           (since queries = mean-pooled hidden states, similar to their neighbors)
+        - Gated residual with gate ≈ 0 → output ≈ queries = original hidden states
         - Frozen KV projections reproduce the LLM's own KV cache
         → output ≈ LLM's real KV cache
     """
@@ -54,6 +54,15 @@ class QFormerKVCompressor(nn.Module):
         # Multi-head attention parameters for routing
         self.num_routing_heads = config.num_routing_heads
         self.routing_head_dim = attn_dim // config.num_routing_heads
+
+        # Relative position bias: per-head learnable slope (ALiBi-style)
+        # Initialized to favor nearby positions; learned during training
+        self.pos_bias_slopes = nn.Parameter(
+            torch.linspace(1.0, 4.0, config.num_routing_heads)
+        )
+
+        # Gated residual: sigmoid(-5) ≈ 0.007, so output ≈ queries at init
+        self.residual_gate = nn.Parameter(torch.tensor(-5.0))
 
         # Frozen per-layer KV projections from the LLM
         # Shape: [num_layers, kv_dim, hidden] (transposed for F.linear)
@@ -88,7 +97,7 @@ class QFormerKVCompressor(nn.Module):
         hidden_states: torch.Tensor,
         layer_emb: torch.Tensor,
     ) -> torch.Tensor:
-        """V-free cross-attention: compute routing weights, apply to raw hidden states.
+        """V-free cross-attention with position bias and gated residual.
 
         Args:
             queries: [num_layers, num_queries, 4096]
@@ -110,17 +119,34 @@ class QFormerKVCompressor(nn.Module):
         q = q.view(batch, num_q, self.num_routing_heads, self.routing_head_dim).transpose(1, 2)
         k = k.view(batch, kv_len, self.num_routing_heads, self.routing_head_dim).transpose(1, 2)
 
-        # Attention weights: [B, heads, Q, D]
+        # Attention scores: [B, heads, Q, D]
         scale = self.routing_head_dim ** -0.5
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
-        attn_weights = F.softmax(attn_weights, dim=-1)
+        attn_logits = torch.matmul(q, k.transpose(-2, -1)) * scale
+
+        # Relative position bias: ALiBi-style distance penalty per head
+        # Positions normalized to [0, 1] so bias is doc-length-invariant
+        q_pos = torch.arange(num_q, device=queries.device, dtype=queries.dtype)
+        k_pos = torch.arange(kv_len, device=queries.device, dtype=queries.dtype)
+        # Normalize: query positions map to center of their pooling window
+        q_pos = (q_pos + 0.5) / num_q
+        k_pos = (k_pos + 0.5) / kv_len
+        # Absolute distance: [Q, D]
+        rel_dist = (q_pos.unsqueeze(1) - k_pos.unsqueeze(0)).abs()
+        # Per-head slopes: [heads, 1, 1] * [Q, D] → [heads, Q, D]
+        pos_bias = -self.pos_bias_slopes.view(-1, 1, 1) * rel_dist.unsqueeze(0)
+        attn_logits = attn_logits + pos_bias.unsqueeze(0)  # broadcast over batch
+
+        attn_weights = F.softmax(attn_logits, dim=-1)
 
         # Apply weights to raw hidden states (no V projection)
-        # hidden_states: [B, D, 4096] → expand for heads → weighted sum
         # All heads share the same values (raw hidden states), so average the
         # attention weights across heads first for efficiency
         attn_weights = attn_weights.mean(dim=1)  # [B, Q, D]
-        compressed = torch.bmm(attn_weights, hidden_states)  # [B, Q, 4096]
+        cross_attn_out = torch.bmm(attn_weights, hidden_states)  # [B, Q, 4096]
+
+        # Gated residual: at init gate ≈ 0, output ≈ queries (identity)
+        gate = torch.sigmoid(self.residual_gate)
+        compressed = gate * cross_attn_out + (1.0 - gate) * queries
 
         return compressed
 
