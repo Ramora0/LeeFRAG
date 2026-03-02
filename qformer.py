@@ -14,9 +14,9 @@ class QFormerKVCompressor(nn.Module):
     Architecture:
         1. Mean-pool hidden states at 4096-dim → initial queries
         2. Per-layer learned embeddings condition the shared routing
-        3. Multi-head cross-attention with bottleneck V projection:
-           Q/K/V project to attn_dim, output projected back to hidden_size
-        4. SwiGLU FFN with gated residual to break the convex hull of input hidden states
+        3. Pre-norm multi-head cross-attention with bottleneck V projection:
+           RMSNorm → Q/K/V project to attn_dim → output projected back to hidden_size
+        4. Pre-norm SwiGLU FFN: RMSNorm → SwiGLU → additive residual
         5. Frozen copies of the LLM's own k_proj/v_proj produce final KV cache entries
 
     At init with compression_ratio=1:
@@ -60,6 +60,10 @@ class QFormerKVCompressor(nn.Module):
         self.pos_bias_slopes = nn.Parameter(
             torch.linspace(0.5, 4.0, config.num_attn_heads)
         )
+
+        # Pre-norm RMSNorm for each sub-layer
+        self.attn_norm = nn.RMSNorm(hidden)
+        self.ffn_norm = nn.RMSNorm(hidden)
 
         # Shared SwiGLU FFN: breaks the convex hull of input hidden states
         ffn_dim = config.ffn_dim
@@ -124,10 +128,14 @@ class QFormerKVCompressor(nn.Module):
         H = self.num_attn_heads
         D = self.attn_head_dim
 
+        # Pre-norm before cross-attention
+        q_normed = self.attn_norm(queries)
+        hs_normed = self.attn_norm(hidden_states)
+
         # Project Q/K/V to attn_dim, add layer conditioning to Q
-        q = self.cross_q(queries) + layer_emb  # [B, Q, attn_dim]
-        k = self.cross_k(hidden_states)         # [B, D_kv, attn_dim]
-        v = self.cross_v(hidden_states)          # [B, D_kv, attn_dim]
+        q = self.cross_q(q_normed) + layer_emb   # [B, Q, attn_dim]
+        k = self.cross_k(hs_normed)               # [B, kv_len, attn_dim]
+        v = self.cross_v(hs_normed)                # [B, kv_len, attn_dim]
 
         # Reshape to multi-head: [B, H, seq, head_dim]
         q = q.view(B, num_q, H, D).transpose(1, 2)
@@ -183,10 +191,14 @@ class QFormerKVCompressor(nn.Module):
         hs_flat = chunked_hs.reshape(N, chunk_size, -1)  # [N, cs, 4096]
         le_flat = layer_emb.expand(-1, num_chunks, -1).reshape(N, 1, -1)
 
+        # Pre-norm before cross-attention
+        q_normed = self.attn_norm(q_flat)
+        hs_normed = self.attn_norm(hs_flat)
+
         # Project Q/K/V
-        q = self.cross_q(q_flat) + le_flat  # [N, 1, attn_dim]
-        k = self.cross_k(hs_flat)           # [N, cs, attn_dim]
-        v = self.cross_v(hs_flat)           # [N, cs, attn_dim]
+        q = self.cross_q(q_normed) + le_flat  # [N, 1, attn_dim]
+        k = self.cross_k(hs_normed)           # [N, cs, attn_dim]
+        v = self.cross_v(hs_normed)           # [N, cs, attn_dim]
 
         # Multi-head reshape: [N, H, seq, head_dim]
         q = q.view(N, 1, H, D).transpose(1, 2)
@@ -225,7 +237,8 @@ class QFormerKVCompressor(nn.Module):
         Returns:
             output: [num_layers, num_queries, 4096]
         """
-        ffn_out = self.ffn_down(F.silu(self.ffn_gate(x)) * self.ffn_up(x))
+        x_normed = self.ffn_norm(x)
+        ffn_out = self.ffn_down(F.silu(self.ffn_gate(x_normed)) * self.ffn_up(x_normed))
         return residual + ffn_out
 
     def _apply_frozen_kv_proj(
