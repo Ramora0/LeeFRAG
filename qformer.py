@@ -66,13 +66,19 @@ class QFormerKVCompressor(nn.Module):
                 llm.model.layers[i].self_attn.v_proj.weight.detach().clone()
                 for i in range(model_config.num_layers)
             ])
+            ln_weights = torch.stack([
+                llm.model.layers[i].input_layernorm.weight.detach().clone()
+                for i in range(model_config.num_layers)
+            ])
         else:
             # Placeholder for loading from checkpoint without LLM access
             k_weights = torch.zeros(model_config.num_layers, kv_dim, hidden)
             v_weights = torch.zeros(model_config.num_layers, kv_dim, hidden)
+            ln_weights = torch.ones(model_config.num_layers, hidden)
 
         self.register_buffer("frozen_k_proj", k_weights)  # [32, 1024, 4096]
         self.register_buffer("frozen_v_proj", v_weights)  # [32, 1024, 4096]
+        self.register_buffer("frozen_ln_weight", ln_weights)  # [32, 4096]
 
         self.gradient_checkpointing = config.gradient_checkpointing
 
@@ -121,7 +127,11 @@ class QFormerKVCompressor(nn.Module):
     def _apply_frozen_kv_proj(
         self, compressed: torch.Tensor,
     ) -> list[tuple[torch.Tensor, torch.Tensor]]:
-        """Apply frozen per-layer LLM KV projections.
+        """Apply frozen per-layer RMSNorm + KV projections.
+
+        The LLM computes KV as: k_proj(RMSNorm(hidden_states)). The hidden
+        states from extract_doc_hidden_states are pre-norm (residual stream),
+        so we must apply the frozen input_layernorm before the KV projections.
 
         Args:
             compressed: [num_layers, num_queries, 4096]
@@ -133,6 +143,11 @@ class QFormerKVCompressor(nn.Module):
         num_layers, num_q, _ = compressed.shape
         num_kv_heads = self.model_config.num_kv_heads
         head_dim = self.model_config.head_dim
+
+        # Apply frozen RMSNorm (input_layernorm) before KV projections
+        variance = compressed.pow(2).mean(-1, keepdim=True)
+        compressed = compressed * torch.rsqrt(variance + 1e-5)
+        compressed = compressed * self.frozen_ln_weight.unsqueeze(1)  # [32, 1, 4096]
 
         # Batched matmul: [num_layers, Q, 4096] @ [num_layers, 4096, kv_dim] → [num_layers, Q, kv_dim]
         k = torch.bmm(compressed, self.frozen_k_proj.transpose(1, 2))
