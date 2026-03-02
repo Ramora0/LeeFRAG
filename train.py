@@ -340,7 +340,7 @@ def main():
     # Verify gradient flow on first step
     logger.info("Running gradient flow verification...")
     sample_batch = next(iter(train_loader))
-    loss = trainer._training_step(sample_batch, compression_ratio=2)
+    loss = trainer._training_step(sample_batch, compression_ratio=2, global_step=0)
     if loss is not None:
         loss.backward()
         trainer.verify_gradient_flow()

@@ -57,3 +57,5 @@ class TrainingConfig:
     hidden_state_layers: str = "all"  # "all" or "last_N" (e.g. "last_8")
     gradient_checkpoint_llm: bool = False
     offload_stage_a_to_cpu: bool = False
+    kv_blend_start: float = 0.9  # initial real-KV weight (1.0 = all real, 0.0 = all compressed)
+    kv_blend_steps: int = 0  # steps to anneal blend to 0; 0 = auto (1x phase length)

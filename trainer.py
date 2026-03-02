@@ -73,6 +73,13 @@ class TwoStageTrainer:
             training_config, self.total_steps
         )
 
+        # KV blend: anneal from real KV to compressed KV during 1x phase
+        self.blend_steps = training_config.kv_blend_steps
+        if self.blend_steps == 0:
+            # Auto: blend over the entire 1x compression phase
+            self.blend_steps = self.compression_scheduler.steps_per_phase
+        self.blend_start = training_config.kv_blend_start
+
         # Scaler for mixed precision
         self.scaler = torch.amp.GradScaler("cuda", enabled=training_config.fp16)
 
@@ -112,7 +119,7 @@ class TwoStageTrainer:
                     global_step
                 )
 
-                loss = self._training_step(batch, compression_ratio)
+                loss = self._training_step(batch, compression_ratio, global_step)
 
                 if loss is None:
                     continue
@@ -163,9 +170,10 @@ class TwoStageTrainer:
                     # Update progress bar
                     lr = self.optimizer.param_groups[0]["lr"]
                     phase = self.compression_scheduler.get_phase(global_step)
+                    blend_alpha = self._get_blend_alpha(global_step)
                     use_hs = self.training_config.hidden_state_loss
                     secondary_tag = "hs" if use_hs else "kl"
-                    pbar.set_postfix(
+                    postfix = dict(
                         loss=f"{avg_loss:.4f}",
                         ce=f"{avg_ce:.4f}",
                         **{secondary_tag: f"{avg_kl:.4f}"},
@@ -173,6 +181,9 @@ class TwoStageTrainer:
                         comp=f"{compression_ratio}x",
                         step=f"{global_step}/{self.total_steps}",
                     )
+                    if blend_alpha > 0:
+                        postfix["blend"] = f"{blend_alpha:.2f}"
+                    pbar.set_postfix(**postfix)
 
                     if global_step % self.training_config.logging_steps == 0:
                         if self.use_wandb:
@@ -188,6 +199,7 @@ class TwoStageTrainer:
                                 "train/lr": lr,
                                 "train/compression_ratio": compression_ratio,
                                 "train/empirical_compression_ratio": avg_empirical_ratio,
+                                "train/blend_alpha": blend_alpha,
                                 "train/phase": phase,
                                 "train/global_step": global_step,
                             })
@@ -232,8 +244,50 @@ class TwoStageTrainer:
         self._save_checkpoint(global_step, compression_ratio)
         logger.info("Training complete.")
 
+    def _get_blend_alpha(self, global_step: int) -> float:
+        """Return the real-KV blend weight for the current step.
+
+        Linearly anneals from blend_start → 0 over blend_steps.
+        Returns 0.0 once past the blend window (fully compressed).
+        """
+        if global_step >= self.blend_steps:
+            return 0.0
+        return self.blend_start * (1.0 - global_step / self.blend_steps)
+
+    @torch.no_grad()
+    def _compute_real_kv_cache(
+        self, doc_hidden_states: list[list[torch.Tensor]],
+    ) -> list[list[tuple[torch.Tensor, torch.Tensor]]]:
+        """Compute real KV from hidden states using the LLM's own projections.
+
+        For each layer i, applies the LLM's input_layernorm and k/v projections
+        to the layer-i input hidden states.  No extra forward pass needed.
+
+        Returns:
+            per_doc_real: same shape as Q-Former output — list of per-doc KV,
+                each a list of (K, V) per layer.
+                K/V shape: [1, num_kv_heads, doc_len, head_dim]
+        """
+        num_kv_heads = self.model_config.num_kv_heads
+        head_dim = self.model_config.head_dim
+
+        per_doc_real = []
+        for doc_hs in doc_hidden_states:
+            doc_kv = []
+            for layer_idx in range(self.model_config.num_layers):
+                hs = doc_hs[layer_idx]  # [1, doc_len, 4096]
+                llm_layer = self.model.model.layers[layer_idx]
+                normed = llm_layer.input_layernorm(hs)
+                k = llm_layer.self_attn.k_proj(normed)  # [1, doc_len, kv_dim]
+                v = llm_layer.self_attn.v_proj(normed)
+                k = k.view(1, -1, num_kv_heads, head_dim).transpose(1, 2)
+                v = v.view(1, -1, num_kv_heads, head_dim).transpose(1, 2)
+                doc_kv.append((k, v))
+            per_doc_real.append(doc_kv)
+        return per_doc_real
+
     def _training_step(
-        self, batch: dict, compression_ratio: int
+        self, batch: dict, compression_ratio: int, global_step: int = 0,
     ) -> torch.Tensor | None:
         """Execute one training step (Stage A + Stage B).
 
@@ -269,11 +323,13 @@ class TwoStageTrainer:
                 teacher_qa_hidden = [h.to(self.device) for h in teacher_qa_hidden]
 
         # === Stage B: Compress hidden states and compute loss ===
+        blend_alpha = self._get_blend_alpha(global_step)
+
         with torch.amp.autocast("cuda", enabled=self.training_config.fp16):
             loss = self._stage_b(
                 doc_hidden_states, compression_ratio,
                 stage_b_input_ids, stage_b_labels, teacher_logits,
-                teacher_qa_hidden,
+                teacher_qa_hidden, blend_alpha,
             )
 
         return loss
@@ -373,11 +429,17 @@ class TwoStageTrainer:
         labels: torch.Tensor,
         teacher_logits: torch.Tensor,
         teacher_qa_hidden: list[torch.Tensor] | None = None,
+        blend_alpha: float = 0.0,
     ) -> torch.Tensor:
         """Stage B: Compress hidden states, run LLM, compute loss.
 
         Loss = CE + (hidden_state_matching OR KL), controlled by config.
         Gradients flow through the compressed KV cache back to Q-Former.
+
+        If blend_alpha > 0 and compression_ratio == 1, blends real KV
+        (from LLM's own projections) with compressed KV:
+            KV_used = alpha * real_KV + (1 - alpha) * compressed_KV
+        Gradients flow through (1 - alpha) * compressed_KV to the Q-Former.
         """
         # Compress each document's hidden states into KV caches
         per_doc_compressed = []
@@ -401,6 +463,27 @@ class TwoStageTrainer:
         compressed_cache = apply_rope_to_cache(
             compressed_cache, self.model_config.num_layers, rotary_emb
         )
+
+        # Blend with real KV cache during 1x phase
+        if blend_alpha > 0 and compression_ratio == 1:
+            per_doc_real = self._compute_real_kv_cache(doc_hidden_states)
+            real_cache = concat_compressed_caches(
+                per_doc_real, self.model_config.num_layers
+            )
+            real_cache = apply_rope_to_cache(
+                real_cache, self.model_config.num_layers, rotary_emb
+            )
+            for layer_idx in range(self.model_config.num_layers):
+                real_k = real_cache.layers[layer_idx].keys
+                real_v = real_cache.layers[layer_idx].values
+                comp_k = compressed_cache.layers[layer_idx].keys
+                comp_v = compressed_cache.layers[layer_idx].values
+                compressed_cache.layers[layer_idx].keys = (
+                    blend_alpha * real_k.detach() + (1 - blend_alpha) * comp_k
+                )
+                compressed_cache.layers[layer_idx].values = (
+                    blend_alpha * real_v.detach() + (1 - blend_alpha) * comp_v
+                )
 
         # Forward through frozen LLM with compressed KV prefix
         # No explicit attention_mask: HF generates the correct prefix-causal
