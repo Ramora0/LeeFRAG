@@ -98,6 +98,14 @@ class QFormerKVCompressor(nn.Module):
         self.register_buffer("frozen_v_proj", v_weights)  # [32, 1024, 4096]
         self.register_buffer("frozen_ln_weight", ln_weights)  # [32, 4096]
 
+        # Per-layer low-rank adapter (applied before frozen KV proj)
+        self.layer_adapter_rank = config.layer_adapter_rank
+        if self.layer_adapter_rank > 0:
+            r = self.layer_adapter_rank
+            # Zero-init down so adapter starts as no-op
+            self.layer_adapter_down = nn.Parameter(torch.zeros(model_config.num_layers, hidden, r))
+            self.layer_adapter_up = nn.Parameter(torch.randn(model_config.num_layers, r, hidden) * 0.01)
+
         self.cross_attn_mode = config.cross_attn_mode
 
         # Learned query for chunked cross-attention mode
@@ -371,6 +379,13 @@ class QFormerKVCompressor(nn.Module):
             else:
                 compressed = self._cross_attend(pooled, all_hs, self.layer_embeddings)
                 compressed = self._ffn(compressed, compressed)
+
+        # Per-layer low-rank adapter
+        if self.layer_adapter_rank > 0:
+            compressed = compressed + torch.bmm(
+                torch.bmm(compressed, self.layer_adapter_down),
+                self.layer_adapter_up,
+            )
 
         # Apply frozen LLM KV projections
         return self._apply_frozen_kv_proj(compressed)

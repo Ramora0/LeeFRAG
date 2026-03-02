@@ -23,6 +23,7 @@ class QFormerConfig:
     ffn_dim: int = 256  # SwiGLU intermediate dim
     max_query_tokens: int = 512
     cross_attn_mode: str = "global"  # "global" (mean-pooled queries attend all) or "chunked" (one query per chunk)
+    layer_adapter_rank: int = 0  # if > 0, add per-layer low-rank residual adapter before frozen KV proj
     gradient_checkpointing: bool = False
 
 

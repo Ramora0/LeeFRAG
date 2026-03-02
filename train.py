@@ -30,8 +30,8 @@ def set_seed(seed: int):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train Q-Former KV cache compressor")
-    parser.add_argument("--dataset", type=str, default="rag_v1", choices=["rag_v1", "hotpotqa"],
-                        help="Dataset to train on (default: rag_v1)")
+    parser.add_argument("--dataset", type=str, default="hotpotqa", choices=["rag_v1", "hotpotqa"],
+                        help="Dataset to train on (default: hotpotqa)")
     parser.add_argument("--output_dir", type=str, default="outputs")
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--num_epochs", type=int, default=4)
@@ -47,9 +47,9 @@ def parse_args():
                         help="Train with CE loss only, no KL or hidden state loss")
     parser.add_argument("--kl_weight", type=float, default=1.0, help="Weight for KL divergence loss")
     parser.add_argument("--kl_top_k", type=int, default=0, help="Top-k logits for KL (0=full vocab)")
-    parser.add_argument("--hidden_state_loss", action="store_true",
+    parser.add_argument("--hidden_state_loss", action=argparse.BooleanOptionalAction, default=True,
                         help="Use hidden state matching instead of KL divergence")
-    parser.add_argument("--hidden_state_weight", type=float, default=1.0,
+    parser.add_argument("--hidden_state_weight", type=float, default=10.0,
                         help="Weight for hidden state matching loss")
     parser.add_argument("--hidden_state_layers", type=str, default="all",
                         help="Which layers to match: 'all' or 'last_N' (e.g. 'last_8')")
@@ -60,6 +60,8 @@ def parse_args():
                         help="Cross-attention mode: 'global' (pooled queries attend all) or 'chunked' (one query per chunk)")
     parser.add_argument("--scale", type=int, default=1,
                         help="Scale factor for Q-Former attn_dim and ffn_dim (default: 1)")
+    parser.add_argument("--layer_adapter_rank", type=int, default=0,
+                        help="Per-layer low-rank adapter rank (0=disabled, try 8)")
     return parser.parse_args()
 
 
@@ -93,6 +95,7 @@ def main():
         num_attn_heads=8 * args.scale,
         ffn_dim=256 * args.scale,
         cross_attn_mode=args.cross_attn_mode,
+        layer_adapter_rank=args.layer_adapter_rank,
     )
 
     set_seed(training_config.seed)
