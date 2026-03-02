@@ -57,8 +57,8 @@ class QFormerKVCompressor(nn.Module):
         # Initialized to favor nearby positions; learned during training
         self.pos_bias_slope = nn.Parameter(torch.tensor(2.0))
 
-        # Gated residual: sigmoid(-4) ≈ 0.018, so output ≈ queries at init
-        self.residual_gate = nn.Parameter(torch.tensor(-4.0))
+        # Gated residual: sigmoid(-3) ≈ 0.047, so output ≈ queries at init
+        self.residual_gate = nn.Parameter(torch.tensor(-3.0))
 
         # Shared SwiGLU FFN: breaks the convex hull of input hidden states
         ffn_dim = config.ffn_dim
@@ -68,7 +68,7 @@ class QFormerKVCompressor(nn.Module):
         # Zero-init output so FFN is a no-op at start
         nn.init.zeros_(self.ffn_down.weight)
         # FFN gated residual (separate from cross-attn gate)
-        self.ffn_residual_gate = nn.Parameter(torch.tensor(-4.0))
+        self.ffn_residual_gate = nn.Parameter(torch.tensor(-3.0))
 
         # Frozen per-layer KV projections from the LLM
         # Shape: [num_layers, kv_dim, hidden] (transposed for F.linear)
