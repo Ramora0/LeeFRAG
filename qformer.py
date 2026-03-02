@@ -14,17 +14,14 @@ class QFormerKVCompressor(nn.Module):
     Architecture:
         1. Mean-pool hidden states at 4096-dim → initial queries
         2. Per-layer learned embeddings condition the shared routing
-        3. Pre-norm multi-head cross-attention with bottleneck V projection:
-           RMSNorm → Q/K/V project to attn_dim → output projected back to hidden_size
-        4. Pre-norm SwiGLU FFN: RMSNorm → SwiGLU → additive residual
-        5. Frozen copies of the LLM's own k_proj/v_proj produce final KV cache entries
+        3. Cross-attention: queries gather from document hidden states (ALiBi bias)
+        4. Within-layer self-attention: queries coordinate within each layer (ALiBi bias)
+        5. Cross-layer self-attention: layers coordinate across the full stack (no pos bias)
+        6. SwiGLU FFN: nonlinear transform
+        7. Frozen copies of the LLM's own k_proj/v_proj produce final KV cache entries
 
-    At init with compression_ratio=1:
-        - Mean-pool is identity (window size 1)
-        - Cross-attention output projection zero-initialized → gated residual ≈ identity
-        - FFN residual gate ≈ 0 → FFN is a no-op
-        - Frozen KV projections reproduce the LLM's own KV cache
-        → output ≈ LLM's real KV cache
+    All three attention output projections are zero-initialized, so at init
+    the entire block is identity → frozen KV proj reproduces the LLM's own cache.
     """
 
     def __init__(self, config: QFormerConfig, model_config: ModelConfig, llm=None):
@@ -56,12 +53,37 @@ class QFormerKVCompressor(nn.Module):
         # Zero-init output so cross-attention is a no-op at start
         nn.init.zeros_(self.cross_out.weight)
 
-        # Per-head ALiBi slopes for relative position bias
+        # Per-head ALiBi slopes for cross-attention relative position bias
         self.pos_bias_slopes = nn.Parameter(
             torch.linspace(0.5, 4.0, config.num_attn_heads)
         )
 
-        # Pre-norm RMSNorm for each sub-layer
+        # Within-layer self-attention: queries attend to each other within the same layer
+        self.within_layer_self_attn = config.within_layer_self_attn
+        if self.within_layer_self_attn:
+            self.self_q = nn.Linear(hidden, attn_dim, bias=False)
+            self.self_k = nn.Linear(hidden, attn_dim, bias=False)
+            self.self_v = nn.Linear(hidden, attn_dim, bias=False)
+            self.self_out = nn.Linear(attn_dim, hidden, bias=False)
+            nn.init.zeros_(self.self_out.weight)
+            self.self_attn_norm = nn.RMSNorm(hidden)
+            # ALiBi slopes for within-layer positional bias
+            self.self_pos_bias_slopes = nn.Parameter(
+                torch.linspace(0.5, 4.0, config.num_attn_heads)
+            )
+
+        # Cross-layer pooling: self-attention across layers at each query position
+        self.cross_layer_pooling = config.cross_layer_pooling
+        if self.cross_layer_pooling:
+            self.layer_q = nn.Linear(hidden, attn_dim, bias=False)
+            self.layer_k = nn.Linear(hidden, attn_dim, bias=False)
+            self.layer_v = nn.Linear(hidden, attn_dim, bias=False)
+            self.layer_out = nn.Linear(attn_dim, hidden, bias=False)
+            nn.init.zeros_(self.layer_out.weight)
+            self.layer_attn_norm = nn.RMSNorm(hidden)
+            # No positional bias: layer ordering is semantic, not spatial
+
+        # Pre-norm RMSNorm for cross-attention and FFN sub-layers
         self.attn_norm = nn.RMSNorm(hidden)
         self.ffn_norm = nn.RMSNorm(hidden)
 
@@ -227,6 +249,82 @@ class QFormerKVCompressor(nn.Module):
         # Residual
         return (q_flat + cross_attn_out).reshape(num_layers, num_chunks, -1)
 
+    def _within_layer_self_attend(self, x: torch.Tensor) -> torch.Tensor:
+        """Within-layer self-attention: queries attend to each other per layer.
+
+        Lets queries coordinate — e.g. one specializes on entities, another on
+        reasoning — by seeing what sibling queries are capturing.
+
+        Args:
+            x: [num_layers, num_queries, 4096]
+
+        Returns:
+            output: [num_layers, num_queries, 4096]
+        """
+        B, Q, _ = x.shape
+        H = self.num_attn_heads
+        D = self.attn_head_dim
+
+        x_normed = self.self_attn_norm(x)
+
+        q = self.self_q(x_normed).view(B, Q, H, D).transpose(1, 2)
+        k = self.self_k(x_normed).view(B, Q, H, D).transpose(1, 2)
+        v = self.self_v(x_normed).view(B, Q, H, D).transpose(1, 2)
+
+        scale = D ** -0.5
+        attn_logits = torch.matmul(q, k.transpose(-2, -1)) * scale
+
+        # ALiBi position bias over query positions
+        pos = torch.arange(Q, device=x.device, dtype=x.dtype)
+        rel_dist = (pos.unsqueeze(1) - pos.unsqueeze(0)).abs()  # [Q, Q]
+        pos_bias = -self.self_pos_bias_slopes.view(-1, 1, 1) * rel_dist
+        attn_logits = attn_logits + pos_bias.unsqueeze(0)
+
+        attn_weights = F.softmax(attn_logits, dim=-1)
+        attn_out = torch.matmul(attn_weights, v)
+
+        attn_out = attn_out.transpose(1, 2).reshape(B, Q, -1)
+        return x + self.self_out(attn_out)
+
+    def _cross_layer_attend(self, x: torch.Tensor) -> torch.Tensor:
+        """Cross-layer self-attention: each query position attends across layers.
+
+        Transposes the layer and query dims so that position i across all 32
+        layers forms a length-32 sequence. Layers can see what other layers
+        chose to compress and coordinate accordingly.
+
+        Args:
+            x: [num_layers, num_queries, 4096]
+
+        Returns:
+            output: [num_layers, num_queries, 4096]
+        """
+        L, Q, C = x.shape
+        H = self.num_attn_heads
+        D = self.attn_head_dim
+
+        # Transpose: [num_layers, Q, C] → [Q, num_layers, C]
+        x_t = x.transpose(0, 1)
+
+        x_normed = self.layer_attn_norm(x_t)
+
+        q = self.layer_q(x_normed).view(Q, L, H, D).transpose(1, 2)
+        k = self.layer_k(x_normed).view(Q, L, H, D).transpose(1, 2)
+        v = self.layer_v(x_normed).view(Q, L, H, D).transpose(1, 2)
+
+        scale = D ** -0.5
+        attn_logits = torch.matmul(q, k.transpose(-2, -1)) * scale
+        # No positional bias — layer identity is semantic, not spatial
+
+        attn_weights = F.softmax(attn_logits, dim=-1)
+        attn_out = torch.matmul(attn_weights, v)
+
+        attn_out = attn_out.transpose(1, 2).reshape(Q, L, -1)
+        out = x_t + self.layer_out(attn_out)
+
+        # Transpose back: [Q, num_layers, C] → [num_layers, Q, C]
+        return out.transpose(0, 1)
+
     def _ffn(self, x: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
         """Shared SwiGLU FFN with gated residual back to original queries.
 
@@ -276,6 +374,14 @@ class QFormerKVCompressor(nn.Module):
 
         return [(k[i : i + 1], v[i : i + 1]) for i in range(num_layers)]
 
+    def _apply_self_attn_layers(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply within-layer self-attention and cross-layer pooling if enabled."""
+        if self.within_layer_self_attn:
+            x = self._within_layer_self_attend(x)
+        if self.cross_layer_pooling:
+            x = self._cross_layer_attend(x)
+        return x
+
     def _forward_inner(
         self,
         queries: torch.Tensor,
@@ -284,6 +390,7 @@ class QFormerKVCompressor(nn.Module):
     ) -> torch.Tensor:
         """Inner forward for gradient checkpointing."""
         x = self._cross_attend(queries, all_hs, layer_emb)
+        x = self._apply_self_attn_layers(x)
         x = self._ffn(x, x)
         return x
 
@@ -295,6 +402,7 @@ class QFormerKVCompressor(nn.Module):
     ) -> torch.Tensor:
         """Inner forward (chunked mode) for gradient checkpointing."""
         x = self._cross_attend_chunked(queries, chunked_hs, layer_emb)
+        x = self._apply_self_attn_layers(x)
         x = self._ffn(x, x)
         return x
 
@@ -350,6 +458,7 @@ class QFormerKVCompressor(nn.Module):
                 )
             else:
                 compressed = self._cross_attend_chunked(queries, chunked_hs, self.layer_embeddings)
+                compressed = self._apply_self_attn_layers(compressed)
                 compressed = self._ffn(compressed, compressed)
         else:
             # Global mode: mean-pooled queries attend to entire sequence
@@ -370,6 +479,7 @@ class QFormerKVCompressor(nn.Module):
                 )
             else:
                 compressed = self._cross_attend(pooled, all_hs, self.layer_embeddings)
+                compressed = self._apply_self_attn_layers(compressed)
                 compressed = self._ffn(compressed, compressed)
 
         # Apply frozen LLM KV projections

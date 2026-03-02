@@ -20,9 +20,11 @@ class ModelConfig:
 class QFormerConfig:
     attn_dim: int = 256  # projection dim for cross-attention Q/K/V
     num_attn_heads: int = 8  # number of attention heads (attn_dim must be divisible)
-    ffn_dim: int = 1024  # SwiGLU intermediate dim (4096 → 1024 → 4096, ~12M params)
+    ffn_dim: int = 384  # SwiGLU intermediate dim (4096 → 384 → 4096, ~4.7M params)
     max_query_tokens: int = 512
     cross_attn_mode: str = "global"  # "global" (mean-pooled queries attend all) or "chunked" (one query per chunk)
+    within_layer_self_attn: bool = True  # query ↔ query self-attention within each layer
+    cross_layer_pooling: bool = True  # layer ↔ layer self-attention across all 32 layers
     gradient_checkpointing: bool = False
 
 

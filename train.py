@@ -58,6 +58,12 @@ def parse_args():
                         help="Compression ratio schedule (default: 1 2 4 8 16)")
     parser.add_argument("--cross_attn_mode", type=str, default="global", choices=["global", "chunked"],
                         help="Cross-attention mode: 'global' (pooled queries attend all) or 'chunked' (one query per chunk)")
+    parser.add_argument("--no_within_layer_self_attn", action="store_true",
+                        help="Disable within-layer self-attention (query-query coordination)")
+    parser.add_argument("--no_cross_layer_pooling", action="store_true",
+                        help="Disable cross-layer pooling (layer-layer coordination)")
+    parser.add_argument("--ffn_dim", type=int, default=384,
+                        help="SwiGLU FFN intermediate dim (default: 384)")
     return parser.parse_args()
 
 
@@ -86,7 +92,12 @@ def main():
         compression_schedule=args.compression_schedule,
     )
 
-    qformer_config = QFormerConfig(cross_attn_mode=args.cross_attn_mode)
+    qformer_config = QFormerConfig(
+        cross_attn_mode=args.cross_attn_mode,
+        within_layer_self_attn=not args.no_within_layer_self_attn,
+        cross_layer_pooling=not args.no_cross_layer_pooling,
+        ffn_dim=args.ffn_dim,
+    )
 
     set_seed(training_config.seed)
     os.makedirs(training_config.output_dir, exist_ok=True)

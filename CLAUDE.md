@@ -42,15 +42,21 @@ Only Q-Former parameters are trained. Gradients flow through the compressed KV c
 
 ### Q-Former (qformer.py)
 
-`QFormerKVCompressor` contains 8 Q-Former layers, each responsible for a group of 4 LLM layers (8 × 4 = 32 total). Each layer:
-1. Self-attention among learned query tokens
-2. Cross-attention to projected LLM hidden states (4096 → 1024 dim)
-3. SwiGLU FFN
-4. Output K/V projections back to LLM's KV dimensions per layer in the group
+`QFormerKVCompressor` processes all 32 LLM layers through a shared parameter block with four sub-layers:
 
-Query count is dynamic: `doc_len // compression_ratio` (max 512). Sinusoidal positional embeddings encode relative position in `[0, 1]`.
+1. **Cross-attention** (queries ← hidden states): Each query gathers from document hidden states. Per-layer learned embeddings condition the Q projection. ALiBi position bias. (~4.2M params)
+2. **Within-layer self-attention** (query ↔ query): Queries within each layer coordinate what each captures (e.g., entities vs reasoning). ALiBi position bias. (~4.2M params)
+3. **Cross-layer self-attention** (layer ↔ layer): Transposes `[32, Q, 4096]` → `[Q, 32, 4096]` so each query position attends across all 32 layers. No positional bias (layer ordering is semantic). (~4.2M params)
+4. **SwiGLU FFN** (4096→384→4096): Smaller nonlinear transform since attention layers carry more load. (~4.7M params)
+5. **Frozen KV projections**: LLM's own k_proj/v_proj produce final KV cache entries.
 
-Cross-attention modes: `global` (all queries attend to all inputs) or `windowed` (local attention windows).
+All three attention output projections are zero-initialized → at init the block is identity → frozen KV proj reproduces the LLM's own cache.
+
+Query count is dynamic: `doc_len // compression_ratio` (max 512). ALiBi slopes provide relative position bias in cross-attention and within-layer self-attention.
+
+Cross-attention modes: `global` (mean-pooled queries attend all) or `chunked` (one learned query per chunk).
+
+The two self-attention modules can be disabled via `--no_within_layer_self_attn` and `--no_cross_layer_pooling`. FFN dim is configurable via `--ffn_dim`.
 
 ### Compression Schedule (scheduler.py)
 
