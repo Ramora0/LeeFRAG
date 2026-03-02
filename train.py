@@ -154,12 +154,22 @@ def verify_identity_passthrough(model, qformer, train_loader, model_config, devi
         logger.info(f"  {label}: CE={ce:.4f} (ppl={math.exp(ce):.2f}), KL={kl:.4f}, prefix_len={prefix_len}")
         return ce, kl
 
-    # --- Run both variants ---
+    # --- Run all variants ---
     logger.info("Identity passthrough test (comparing against Stage A teacher):")
 
+    # 1. REAL KV: use the model's own KV cache from a normal forward pass
+    #    Tests whether past_key_values / DynamicCache mechanism works at all.
+    doc_input = torch.cat([preamble, doc_concat], dim=1)
+    real_outputs = model(input_ids=doc_input, use_cache=True)
+    real_cache = real_outputs.past_key_values
+    _eval_cache(real_cache, "REAL KV (use_cache=True, full causal)")
+
+    # 2. BYPASS: hidden states → frozen RMSNorm → frozen k_proj/v_proj → RoPE
+    #    Tests whether manual KV reconstruction from hidden states is correct.
     bypass_cache = _build_cache(bypass_mode=True)
     _eval_cache(bypass_cache, "BYPASS (no learnable params)")
 
+    # 3. Q-FORMER: normal forward at ratio 1
     qformer_cache = _build_cache(bypass_mode=False)
     _eval_cache(qformer_cache, "Q-FORMER (ratio 1)")
 
