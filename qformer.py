@@ -172,6 +172,7 @@ class QFormerKVCompressor(nn.Module):
         self,
         doc_hidden_states: list[torch.Tensor],
         compression_ratio: int,
+        bypass: bool = False,
     ) -> list[tuple[torch.Tensor, torch.Tensor]]:
         """Compress a single document's hidden states into KV caches.
 
@@ -179,6 +180,8 @@ class QFormerKVCompressor(nn.Module):
             doc_hidden_states: List of hidden states per LLM layer.
                 Each shape: [1, doc_len, llm_hidden_size (4096)]
             compression_ratio: How much to compress (e.g., 4 means doc_len/4 queries).
+            bypass: If True, skip cross-attention entirely and pass hidden states
+                directly through RMSNorm + frozen KV projections. For diagnostics.
 
         Returns:
             compressed_kv: List of (key, value) per LLM layer.
@@ -190,6 +193,10 @@ class QFormerKVCompressor(nn.Module):
 
         # Stack all layers' hidden states: [num_layers, doc_len, 4096]
         all_hs = torch.cat(doc_hidden_states, dim=0)
+
+        if bypass:
+            # Diagnostic: skip all learnable parameters, just RMSNorm + frozen KV proj
+            return self._apply_frozen_kv_proj(all_hs)
 
         # Mean-pool hidden states: [num_layers, num_queries, 4096]
         if num_queries == doc_len:

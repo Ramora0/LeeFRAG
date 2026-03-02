@@ -65,11 +65,17 @@ def parse_args():
 
 @torch.no_grad()
 def verify_identity_passthrough(model, qformer, train_loader, model_config, device):
-    """Test how close the Q-Former is to identity at compression ratio 1.
+    """Test pipeline correctness with bypass and Q-Former at compression ratio 1.
 
-    Compares the KV cache produced by the Q-Former against the LLM's real KV
-    cache from a normal forward pass, reporting per-layer cosine similarity
-    and relative MSE. Also compares final logits.
+    Runs two variants:
+      1. BYPASS: Skip cross-attention, pass hidden states directly through
+         frozen RMSNorm + k_proj/v_proj. If this doesn't match baseline,
+         there's a bug in extraction, RoPE, cache assembly, or positions.
+      2. Q-FORMER: Normal Q-Former forward at ratio 1. Compared against
+         bypass to isolate cross-attention's impact.
+
+    Both are compared against teacher logits from Stage A (block-diagonal),
+    which is the actual training target.
     """
     qformer.eval()
     batch = next(iter(train_loader))
@@ -87,7 +93,7 @@ def verify_identity_passthrough(model, qformer, train_loader, model_config, devi
     preamble_len = preamble_ids.shape[0]
     block_lengths = [preamble_len + doc_lengths[0]] + doc_lengths[1:]
 
-    # --- Stage A: get hidden states ---
+    # --- Stage A: get hidden states + teacher logits ---
     doc_concat = torch.cat(doc_token_ids, dim=0).unsqueeze(0).to(device)
     preamble = preamble_ids.unsqueeze(0).to(device)
     full_input = torch.cat([preamble, doc_concat, stage_b_input_ids], dim=1)
@@ -105,110 +111,82 @@ def verify_identity_passthrough(model, qformer, train_loader, model_config, devi
     )
     teacher_logits = outputs_a.logits[:, sum(block_lengths):, :]
 
-    # --- Real KV cache: normal LLM forward on concatenated docs ---
-    doc_input = torch.cat([preamble, doc_concat], dim=1)
-    real_outputs = model(
-        input_ids=doc_input, use_cache=True, output_hidden_states=False,
-    )
-    real_cache = real_outputs.past_key_values
+    rotary_emb = model.model.rotary_emb
 
-    # --- Q-Former compressed KV at ratio 1 ---
-    with torch.amp.autocast("cuda"):
-        per_doc_compressed = [qformer(doc_hs, compression_ratio=1) for doc_hs in per_doc_hidden]
-        compressed_cache = concat_compressed_caches(per_doc_compressed, model_config.num_layers)
-        rotary_emb = model.model.rotary_emb
-        compressed_cache = apply_rope_to_cache(compressed_cache, model_config.num_layers, rotary_emb)
+    def _build_cache(bypass_mode):
+        with torch.amp.autocast("cuda"):
+            per_doc_compressed = [
+                qformer(doc_hs, compression_ratio=1, bypass=bypass_mode)
+                for doc_hs in per_doc_hidden
+            ]
+            cache = concat_compressed_caches(per_doc_compressed, model_config.num_layers)
+            cache = apply_rope_to_cache(cache, model_config.num_layers, rotary_emb)
+        return cache
 
-    # --- Compare KV caches layer by layer ---
-    total_prefix_len = sum(block_lengths)
-    compressed_prefix_len = compressed_cache.get_seq_length()
-    logger.info(f"Identity test: real prefix len={total_prefix_len}, compressed prefix len={compressed_prefix_len}")
+    def _eval_cache(cache, label):
+        prefix_len = cache.get_seq_length()
+        with torch.amp.autocast("cuda"):
+            out = model(
+                input_ids=stage_b_input_ids,
+                past_key_values=cache,
+                use_cache=False,
+            )
+        logits = out.logits
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = stage_b_labels[:, 1:].contiguous()
+        ce = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            ignore_index=-100,
+        ).item()
 
+        valid_mask = (shift_labels != -100).view(-1)
+        if valid_mask.any():
+            valid_idx = valid_mask.nonzero(as_tuple=True)[0]
+            t_flat = teacher_logits[:, :-1, :].contiguous().view(-1, teacher_logits.size(-1))[valid_idx]
+            s_flat = shift_logits.view(-1, shift_logits.size(-1))[valid_idx]
+            t_lp = F.log_softmax(t_flat.float(), dim=-1)
+            s_lp = F.log_softmax(s_flat.float(), dim=-1)
+            kl = F.kl_div(s_lp, t_lp, log_target=True, reduction="batchmean").item()
+        else:
+            kl = float("nan")
+
+        logger.info(f"  {label}: CE={ce:.4f} (ppl={math.exp(ce):.2f}), KL={kl:.4f}, prefix_len={prefix_len}")
+        return ce, kl
+
+    # --- Run both variants ---
+    logger.info("Identity passthrough test (comparing against Stage A teacher):")
+
+    bypass_cache = _build_cache(bypass_mode=True)
+    _eval_cache(bypass_cache, "BYPASS (no learnable params)")
+
+    qformer_cache = _build_cache(bypass_mode=False)
+    _eval_cache(qformer_cache, "Q-FORMER (ratio 1)")
+
+    # --- KV comparison: bypass vs Q-Former ---
     k_cos_sims = []
     v_cos_sims = []
-    k_rel_mses = []
-    v_rel_mses = []
-
     for layer_idx in range(model_config.num_layers):
-        # Real KV: [batch, num_kv_heads, seq_len, head_dim]
-        real_k = real_cache.layers[layer_idx].keys.float()
-        real_v = real_cache.layers[layer_idx].values.float()
-        comp_k = compressed_cache.layers[layer_idx].keys.float()
-        comp_v = compressed_cache.layers[layer_idx].values.float()
-
-        # Truncate to min length for comparison
-        min_len = min(real_k.shape[2], comp_k.shape[2])
-        real_k = real_k[:, :, :min_len, :]
-        real_v = real_v[:, :, :min_len, :]
-        comp_k = comp_k[:, :, :min_len, :]
-        comp_v = comp_v[:, :, :min_len, :]
-
-        # Cosine similarity (flatten heads and positions)
-        k_cos = F.cosine_similarity(real_k.reshape(-1, real_k.shape[-1]),
-                                     comp_k.reshape(-1, comp_k.shape[-1]), dim=-1).mean().item()
-        v_cos = F.cosine_similarity(real_v.reshape(-1, real_v.shape[-1]),
-                                     comp_v.reshape(-1, comp_v.shape[-1]), dim=-1).mean().item()
+        byp_k = bypass_cache.layers[layer_idx].keys.float()
+        byp_v = bypass_cache.layers[layer_idx].values.float()
+        qf_k = qformer_cache.layers[layer_idx].keys.float()
+        qf_v = qformer_cache.layers[layer_idx].values.float()
+        k_cos = F.cosine_similarity(
+            byp_k.reshape(-1, byp_k.shape[-1]),
+            qf_k.reshape(-1, qf_k.shape[-1]), dim=-1,
+        ).mean().item()
+        v_cos = F.cosine_similarity(
+            byp_v.reshape(-1, byp_v.shape[-1]),
+            qf_v.reshape(-1, qf_v.shape[-1]), dim=-1,
+        ).mean().item()
         k_cos_sims.append(k_cos)
         v_cos_sims.append(v_cos)
 
-        # Relative MSE: MSE / norm(real)^2
-        k_mse = (real_k - comp_k).pow(2).mean().item()
-        v_mse = (real_v - comp_v).pow(2).mean().item()
-        k_norm = real_k.pow(2).mean().item()
-        v_norm = real_v.pow(2).mean().item()
-        k_rel_mses.append(k_mse / max(k_norm, 1e-8))
-        v_rel_mses.append(v_mse / max(v_norm, 1e-8))
-
     avg_k_cos = sum(k_cos_sims) / len(k_cos_sims)
     avg_v_cos = sum(v_cos_sims) / len(v_cos_sims)
-    avg_k_rel_mse = sum(k_rel_mses) / len(k_rel_mses)
-    avg_v_rel_mse = sum(v_rel_mses) / len(v_rel_mses)
-
-    logger.info(f"Identity test KV comparison (avg over {model_config.num_layers} layers):")
-    logger.info(f"  K cosine sim: {avg_k_cos:.4f}  (1.0 = perfect)")
-    logger.info(f"  V cosine sim: {avg_v_cos:.4f}  (1.0 = perfect)")
-    logger.info(f"  K relative MSE: {avg_k_rel_mse:.4f}  (0.0 = perfect)")
-    logger.info(f"  V relative MSE: {avg_v_rel_mse:.4f}  (0.0 = perfect)")
-
-    # Log a few individual layers for detail
-    for i in [0, model_config.num_layers // 2, model_config.num_layers - 1]:
-        logger.info(f"  Layer {i:2d}: K_cos={k_cos_sims[i]:.4f} V_cos={v_cos_sims[i]:.4f} "
-                     f"K_rmse={k_rel_mses[i]:.4f} V_rmse={v_rel_mses[i]:.4f}")
-
-    # --- Compare logits: run LLM with compressed KV vs teacher ---
-    with torch.amp.autocast("cuda"):
-        student_out = model(
-            input_ids=stage_b_input_ids,
-            past_key_values=compressed_cache,
-            use_cache=False,
-        )
-    student_logits = student_out.logits
-
-    # CE on answer tokens
-    shift_logits = student_logits[:, :-1, :].contiguous()
-    shift_labels = stage_b_labels[:, 1:].contiguous()
-    ce_loss = F.cross_entropy(
-        shift_logits.view(-1, shift_logits.size(-1)),
-        shift_labels.view(-1),
-        ignore_index=-100,
-    ).item()
-
-    # KL between teacher and student
-    valid_mask = (shift_labels != -100).view(-1)
-    if valid_mask.any():
-        valid_idx = valid_mask.nonzero(as_tuple=True)[0]
-        t_flat = teacher_logits[:, :-1, :].contiguous().view(-1, teacher_logits.size(-1))[valid_idx]
-        s_flat = shift_logits.view(-1, shift_logits.size(-1))[valid_idx]
-        t_lp = F.log_softmax(t_flat.float(), dim=-1)
-        s_lp = F.log_softmax(s_flat.float(), dim=-1)
-        kl = F.kl_div(s_lp, t_lp, log_target=True, reduction="batchmean").item()
-    else:
-        kl = float("nan")
-
-    logger.info(f"Identity test logit comparison:")
-    logger.info(f"  CE loss (compressed):  {ce_loss:.4f}  (ppl={math.exp(ce_loss):.2f})")
-    logger.info(f"  KL(teacher||student):  {kl:.4f}")
-    logger.info(f"  If identity were perfect, CE should match baseline and KL ~ 0")
+    logger.info(f"  BYPASS vs Q-FORMER KV cosine sim: K={avg_k_cos:.4f}, V={avg_v_cos:.4f}")
+    logger.info(f"  (If BYPASS CE matches baseline, pipeline is correct.)")
+    logger.info(f"  (If BYPASS CE is bad, bug is in extraction/RoPE/cache, not Q-Former.)")
 
     qformer.train()
 
