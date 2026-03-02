@@ -339,24 +339,27 @@ class TwoStageTrainer:
             outputs.hidden_states, block_lengths, self.model_config.num_layers
         )
 
-        # Extract teacher logits over Q+A portion
-        doc_total = sum(block_lengths)
-        teacher_logits = outputs.logits[:, doc_total:, :]
-
-        # Extract teacher Q+A hidden states for hidden state matching
+        # Extract teacher logits/hidden states (skip if CE-only to save memory)
+        teacher_logits = None
         teacher_qa_hidden = None
-        if self.training_config.hidden_state_loss:
-            layer_indices = self._get_hidden_state_layer_indices()
-            teacher_qa_hidden = [
-                outputs.hidden_states[i][:, doc_total:, :] for i in layer_indices
-            ]
+
+        if not self.training_config.ce_only_loss:
+            doc_total = sum(block_lengths)
+            teacher_logits = outputs.logits[:, doc_total:, :]
+
+            if self.training_config.hidden_state_loss:
+                layer_indices = self._get_hidden_state_layer_indices()
+                teacher_qa_hidden = [
+                    outputs.hidden_states[i][:, doc_total:, :] for i in layer_indices
+                ]
 
         if self.training_config.offload_stage_a_to_cpu:
             per_doc_hidden = [
                 [hs.cpu() for hs in doc_hs]
                 for doc_hs in per_doc_hidden
             ]
-            teacher_logits = teacher_logits.cpu()
+            if teacher_logits is not None:
+                teacher_logits = teacher_logits.cpu()
             if teacher_qa_hidden is not None:
                 teacher_qa_hidden = [h.cpu() for h in teacher_qa_hidden]
 
@@ -423,7 +426,10 @@ class TwoStageTrainer:
             ignore_index=-100,
         )
 
-        if use_hs_loss and teacher_qa_hidden is not None:
+        if self.training_config.ce_only_loss:
+            total_loss = ce_loss
+            self._last_kl_loss = 0.0
+        elif use_hs_loss and teacher_qa_hidden is not None:
             # === Hidden state matching: teacher (full context) vs student (compressed) ===
             hs_loss = self._compute_hidden_state_loss(
                 teacher_qa_hidden, outputs.hidden_states
@@ -605,7 +611,9 @@ class TwoStageTrainer:
                     ignore_index=-100,
                 )
 
-                if use_hs_loss and teacher_qa_hidden is not None:
+                if self.training_config.ce_only_loss:
+                    secondary_loss = torch.tensor(0.0)
+                elif use_hs_loss and teacher_qa_hidden is not None:
                     secondary_loss = self._compute_hidden_state_loss(
                         teacher_qa_hidden, outputs.hidden_states
                     )

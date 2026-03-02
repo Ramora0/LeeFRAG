@@ -43,6 +43,8 @@ def parse_args():
     parser.add_argument("--no_wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument("--gradient_checkpoint_llm", action="store_true")
     parser.add_argument("--offload_stage_a_to_cpu", action="store_true")
+    parser.add_argument("--ce_only", action="store_true",
+                        help="Train with CE loss only, no KL or hidden state loss")
     parser.add_argument("--kl_weight", type=float, default=1.0, help="Weight for KL divergence loss")
     parser.add_argument("--kl_top_k", type=int, default=0, help="Top-k logits for KL (0=full vocab)")
     parser.add_argument("--hidden_state_loss", action="store_true",
@@ -74,6 +76,7 @@ def main():
         use_wandb=not args.no_wandb,
         gradient_checkpoint_llm=args.gradient_checkpoint_llm,
         offload_stage_a_to_cpu=args.offload_stage_a_to_cpu,
+        ce_only_loss=args.ce_only,
         kl_weight=args.kl_weight,
         kl_top_k=args.kl_top_k,
         hidden_state_loss=args.hidden_state_loss,

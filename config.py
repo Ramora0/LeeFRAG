@@ -40,7 +40,7 @@ class TrainingConfig:
     adam_beta2: float = 0.95
     warmup_ratio: float = 0.05
     max_grad_norm: float = 1.0
-    compression_schedule: list[int] = field(default_factory=lambda: [2, 4, 8, 16])
+    compression_schedule: list[int] = field(default_factory=lambda: [1, 2, 4, 8, 16])
     eval_split_ratio: float = 0.1
     eval_steps: int = None  # auto: steps_per_epoch // 3
     save_steps: int = 500
@@ -49,6 +49,7 @@ class TrainingConfig:
     fp16: bool = True
     dataloader_num_workers: int = 4
     use_wandb: bool = True
+    ce_only_loss: bool = False  # CE only, no KL or hidden state loss (saves memory)
     kl_weight: float = 1.0  # alpha for KL divergence loss: total = CE + alpha * KL
     kl_top_k: int = 0  # if > 0, compute KL only over top-k teacher logits (memory saving)
     hidden_state_loss: bool = False  # use hidden state matching instead of KL
