@@ -16,7 +16,7 @@ from config import ModelConfig, QFormerConfig, TrainingConfig
 from collator import RAGCollator
 from dataset import create_dataset
 from kv_cache_utils import apply_rope_to_cache, concat_compressed_caches, extract_doc_hidden_states
-from block_attention import build_block_causal_mask_with_qa
+from block_attention import build_block_causal_mask_with_qa, build_prefix_causal_mask
 from qformer import QFormerKVCompressor
 from trainer import TwoStageTrainer
 
