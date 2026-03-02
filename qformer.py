@@ -193,24 +193,21 @@ class QFormerKVCompressor(nn.Module):
         attn_weights = F.softmax(attn_logits, dim=-1)        # [N, 1, cs]
         cross_attn_out = torch.bmm(attn_weights, hs_flat)    # [N, 1, 4096]
 
-        # Gated residual: at init gate ≈ 0, output ≈ learned query
-        gate = torch.sigmoid(self.residual_gate)
-        compressed = gate * cross_attn_out + (1.0 - gate) * q_flat
+        return cross_attn_out.reshape(num_layers, num_chunks, -1)  # [num_layers, num_chunks, 4096]
 
-        return compressed.reshape(num_layers, num_chunks, -1)  # [num_layers, num_chunks, 4096]
-
-    def _ffn(self, x: torch.Tensor) -> torch.Tensor:
-        """Shared SwiGLU FFN with gated residual.
+    def _ffn(self, x: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
+        """Shared SwiGLU FFN with gated residual back to original queries.
 
         Args:
-            x: [num_layers, num_queries, 4096]
+            x: [num_layers, num_queries, 4096] — cross-attention output
+            residual: [num_layers, num_queries, 4096] — original mean-pooled queries
 
         Returns:
             output: [num_layers, num_queries, 4096]
         """
         ffn_out = self.ffn_down(F.silu(self.ffn_gate(x)) * self.ffn_up(x))
         gate = torch.sigmoid(self.ffn_residual_gate)
-        return gate * ffn_out + x
+        return gate * ffn_out + residual
 
     def _apply_frozen_kv_proj(
         self, compressed: torch.Tensor,
@@ -255,7 +252,7 @@ class QFormerKVCompressor(nn.Module):
     ) -> torch.Tensor:
         """Inner forward for gradient checkpointing."""
         x = self._cross_attend(queries, all_hs, layer_emb)
-        x = self._ffn(x)
+        x = self._ffn(x, x)
         return x
 
     def _forward_inner_chunked(
@@ -266,7 +263,7 @@ class QFormerKVCompressor(nn.Module):
     ) -> torch.Tensor:
         """Inner forward (chunked mode) for gradient checkpointing."""
         x = self._cross_attend_chunked(queries, chunked_hs, layer_emb)
-        x = self._ffn(x)
+        x = self._ffn(x, x)
         return x
 
     def forward(
@@ -321,7 +318,7 @@ class QFormerKVCompressor(nn.Module):
                 )
             else:
                 compressed = self._cross_attend_chunked(queries, chunked_hs, self.layer_embeddings)
-                compressed = self._ffn(compressed)
+                compressed = self._ffn(compressed, compressed)
         else:
             # Global mode: mean-pooled queries attend to entire sequence
             # Mean-pool hidden states: [num_layers, num_queries, 4096]
@@ -341,7 +338,7 @@ class QFormerKVCompressor(nn.Module):
                 )
             else:
                 compressed = self._cross_attend(pooled, all_hs, self.layer_embeddings)
-                compressed = self._ffn(compressed)
+                compressed = self._ffn(compressed, compressed)
 
         # Apply frozen LLM KV projections
         return self._apply_frozen_kv_proj(compressed)

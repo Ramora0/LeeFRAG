@@ -1,0 +1,1 @@
+python train.py --dataset hotpotqa --hidden_state_loss --hidden_state_weight 10.0 --compression_schedule 8
