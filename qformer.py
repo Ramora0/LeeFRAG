@@ -13,18 +13,15 @@ class QFormerKVCompressor(nn.Module):
 
     Architecture:
         1. Mean-pool hidden states at 4096-dim → initial queries
-        2. Self-attention: queries coordinate to specialize before routing
-        3. Per-layer learned embeddings condition the shared routing
-        4. V-free cross-attention with relative position bias: small Wq/Wk compute
-           attention routing weights, raw 4096-dim hidden states are the values (no Wv)
-        5. Gated residual: output = gate * cross_attn + (1-gate) * queries
-        6. SwiGLU FFN with gated residual to break the convex hull of input hidden states
-        7. Frozen copies of the LLM's own k_proj/v_proj produce final KV cache entries
+        2. Per-layer learned embeddings condition the shared routing
+        3. Multi-head cross-attention with bottleneck V projection:
+           Q/K/V project to attn_dim, output projected back to hidden_size
+        4. SwiGLU FFN with gated residual to break the convex hull of input hidden states
+        5. Frozen copies of the LLM's own k_proj/v_proj produce final KV cache entries
 
     At init with compression_ratio=1:
         - Mean-pool is identity (window size 1)
-        - Self-attention gate ≈ 0 → no-op
-        - Cross-attention gated residual with gate ≈ 0 → output ≈ queries
+        - Cross-attention output projection zero-initialized → gated residual ≈ identity
         - FFN residual gate ≈ 0 → FFN is a no-op
         - Frozen KV projections reproduce the LLM's own KV cache
         → output ≈ LLM's real KV cache
@@ -48,19 +45,21 @@ class QFormerKVCompressor(nn.Module):
             torch.randn(model_config.num_layers, 1, attn_dim) * 0.02
         )
 
-        # Cross-attention routing: project to small attn_dim for computing weights
-        # Initialized identically so dot products favor nearby (similar) positions
+        # Multi-head cross-attention with bottleneck V
+        self.num_attn_heads = config.num_attn_heads
+        self.attn_head_dim = attn_dim // config.num_attn_heads
+
         self.cross_q = nn.Linear(hidden, attn_dim, bias=False)
         self.cross_k = nn.Linear(hidden, attn_dim, bias=False)
-        with torch.no_grad():
-            self.cross_k.weight.copy_(self.cross_q.weight)
+        self.cross_v = nn.Linear(hidden, attn_dim, bias=False)
+        self.cross_out = nn.Linear(attn_dim, hidden, bias=False)
+        # Zero-init output so cross-attention is a no-op at start
+        nn.init.zeros_(self.cross_out.weight)
 
-        # Relative position bias: learnable slope (ALiBi-style)
-        # Initialized to favor nearby positions; learned during training
-        self.pos_bias_slope = nn.Parameter(torch.tensor(2.0))
-
-        # Gated residual: sigmoid(-3) ≈ 0.047, so output ≈ queries at init
-        self.residual_gate = nn.Parameter(torch.tensor(-3.0))
+        # Per-head ALiBi slopes for relative position bias
+        self.pos_bias_slopes = nn.Parameter(
+            torch.linspace(0.5, 4.0, config.num_attn_heads)
+        )
 
         # Shared SwiGLU FFN: breaks the convex hull of input hidden states
         ffn_dim = config.ffn_dim
@@ -111,7 +110,7 @@ class QFormerKVCompressor(nn.Module):
         hidden_states: torch.Tensor,
         layer_emb: torch.Tensor,
     ) -> torch.Tensor:
-        """V-free cross-attention with position bias and gated residual.
+        """Multi-head cross-attention with bottleneck V and ALiBi position bias.
 
         Args:
             queries: [num_layers, num_queries, 4096]
@@ -119,37 +118,46 @@ class QFormerKVCompressor(nn.Module):
             layer_emb: [num_layers, 1, attn_dim]
 
         Returns:
-            compressed: [num_layers, num_queries, 4096]
+            output: [num_layers, num_queries, 4096]
         """
-        batch = queries.shape[0]
+        B = queries.shape[0]
         num_q = queries.shape[1]
         kv_len = hidden_states.shape[1]
+        H = self.num_attn_heads
+        D = self.attn_head_dim
 
-        # Project to small attn_dim for routing, then add per-layer conditioning
+        # Project Q/K/V to attn_dim, add layer conditioning to Q
         q = self.cross_q(queries) + layer_emb  # [B, Q, attn_dim]
-        k = self.cross_k(hidden_states)  # [B, D, attn_dim]
+        k = self.cross_k(hidden_states)         # [B, D_kv, attn_dim]
+        v = self.cross_v(hidden_states)          # [B, D_kv, attn_dim]
 
-        # Attention scores: [B, Q, D]
-        scale = q.shape[-1] ** -0.5
-        attn_logits = torch.bmm(q, k.transpose(-2, -1)) * scale
+        # Reshape to multi-head: [B, H, seq, head_dim]
+        q = q.view(B, num_q, H, D).transpose(1, 2)
+        k = k.view(B, kv_len, H, D).transpose(1, 2)
+        v = v.view(B, kv_len, H, D).transpose(1, 2)
 
-        # Relative position bias: ALiBi-style distance penalty
-        # Positions normalized to [0, 1] so bias is doc-length-invariant
+        # Attention scores: [B, H, Q, kv_len]
+        scale = D ** -0.5
+        attn_logits = torch.matmul(q, k.transpose(-2, -1)) * scale
+
+        # Per-head ALiBi position bias
         q_pos = torch.arange(num_q, device=queries.device, dtype=queries.dtype)
         k_pos = torch.arange(kv_len, device=queries.device, dtype=queries.dtype)
         q_pos = (q_pos + 0.5) / num_q
         k_pos = (k_pos + 0.5) / kv_len
-        rel_dist = (q_pos.unsqueeze(1) - k_pos.unsqueeze(0)).abs()  # [Q, D]
-        attn_logits = attn_logits - self.pos_bias_slope * rel_dist
+        rel_dist = (q_pos.unsqueeze(1) - k_pos.unsqueeze(0)).abs()  # [Q, kv_len]
+        pos_bias = -self.pos_bias_slopes.view(-1, 1, 1) * rel_dist  # [H, Q, kv_len]
+        attn_logits = attn_logits + pos_bias.unsqueeze(0)  # broadcast over B
 
-        attn_weights = F.softmax(attn_logits, dim=-1)  # [B, Q, D]
-        cross_attn_out = torch.bmm(attn_weights, hidden_states)  # [B, Q, 4096]
+        attn_weights = F.softmax(attn_logits, dim=-1)  # [B, H, Q, kv_len]
+        attn_out = torch.matmul(attn_weights, v)  # [B, H, Q, head_dim]
 
-        # Gated residual: at init gate ≈ 0, output ≈ queries (identity)
-        gate = torch.sigmoid(self.residual_gate)
-        compressed = gate * cross_attn_out + (1.0 - gate) * queries
+        # Concatenate heads and project back to hidden_size
+        attn_out = attn_out.transpose(1, 2).reshape(B, num_q, -1)  # [B, Q, attn_dim]
+        cross_attn_out = self.cross_out(attn_out)  # [B, Q, 4096]
 
-        return compressed
+        # Residual: cross_out is zero-init so this starts as identity
+        return queries + cross_attn_out
 
     def _cross_attend_chunked(
         self,
@@ -157,7 +165,7 @@ class QFormerKVCompressor(nn.Module):
         chunked_hs: torch.Tensor,
         layer_emb: torch.Tensor,
     ) -> torch.Tensor:
-        """Chunked cross-attention: one learned query attends to each chunk independently.
+        """Chunked multi-head cross-attention: one learned query attends to each chunk.
 
         Args:
             queries: [num_layers, num_chunks, 4096] (expanded learned query)
@@ -168,32 +176,46 @@ class QFormerKVCompressor(nn.Module):
             compressed: [num_layers, num_chunks, 4096]
         """
         num_layers, num_chunks, chunk_size, _ = chunked_hs.shape
+        H = self.num_attn_heads
+        D = self.attn_head_dim
 
-        # Flatten layers and chunks into batch dim for efficient batched attention
-        q_flat = queries.reshape(num_layers * num_chunks, 1, -1)       # [N, 1, 4096]
-        hs_flat = chunked_hs.reshape(num_layers * num_chunks, chunk_size, -1)  # [N, cs, 4096]
-        le_flat = layer_emb.expand(-1, num_chunks, -1).reshape(
-            num_layers * num_chunks, 1, -1
-        )  # [N, 1, attn_dim]
+        # Flatten layers and chunks into batch dim
+        N = num_layers * num_chunks
+        q_flat = queries.reshape(N, 1, -1)       # [N, 1, 4096]
+        hs_flat = chunked_hs.reshape(N, chunk_size, -1)  # [N, cs, 4096]
+        le_flat = layer_emb.expand(-1, num_chunks, -1).reshape(N, 1, -1)
 
-        # Project to attn_dim for routing
+        # Project Q/K/V
         q = self.cross_q(q_flat) + le_flat  # [N, 1, attn_dim]
         k = self.cross_k(hs_flat)           # [N, cs, attn_dim]
+        v = self.cross_v(hs_flat)           # [N, cs, attn_dim]
 
-        scale = q.shape[-1] ** -0.5
-        attn_logits = torch.bmm(q, k.transpose(-2, -1)) * scale  # [N, 1, cs]
+        # Multi-head reshape: [N, H, seq, head_dim]
+        q = q.view(N, 1, H, D).transpose(1, 2)
+        k = k.view(N, chunk_size, H, D).transpose(1, 2)
+        v = v.view(N, chunk_size, H, D).transpose(1, 2)
 
-        # Relative position bias within each chunk
+        # Attention scores: [N, H, 1, cs]
+        scale = D ** -0.5
+        attn_logits = torch.matmul(q, k.transpose(-2, -1)) * scale
+
+        # Per-head ALiBi position bias within each chunk
         k_pos = torch.arange(chunk_size, device=queries.device, dtype=queries.dtype)
         k_pos = (k_pos + 0.5) / chunk_size
         q_pos = torch.tensor([0.5], device=queries.device, dtype=queries.dtype)
         rel_dist = (q_pos.unsqueeze(1) - k_pos.unsqueeze(0)).abs()  # [1, cs]
-        attn_logits = attn_logits - self.pos_bias_slope * rel_dist
+        pos_bias = -self.pos_bias_slopes.view(-1, 1, 1) * rel_dist  # [H, 1, cs]
+        attn_logits = attn_logits + pos_bias.unsqueeze(0)
 
-        attn_weights = F.softmax(attn_logits, dim=-1)        # [N, 1, cs]
-        cross_attn_out = torch.bmm(attn_weights, hs_flat)    # [N, 1, 4096]
+        attn_weights = F.softmax(attn_logits, dim=-1)  # [N, H, 1, cs]
+        attn_out = torch.matmul(attn_weights, v)  # [N, H, 1, head_dim]
 
-        return cross_attn_out.reshape(num_layers, num_chunks, -1)  # [num_layers, num_chunks, 4096]
+        # Concatenate heads and project
+        attn_out = attn_out.transpose(1, 2).reshape(N, 1, -1)  # [N, 1, attn_dim]
+        cross_attn_out = self.cross_out(attn_out)  # [N, 1, 4096]
+
+        # Residual
+        return (q_flat + cross_attn_out).reshape(num_layers, num_chunks, -1)
 
     def _ffn(self, x: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
         """Shared SwiGLU FFN with gated residual back to original queries.
