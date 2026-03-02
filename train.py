@@ -55,8 +55,8 @@ def parse_args():
                         help="Which layers to match: 'all' or 'last_N' (e.g. 'last_8')")
     parser.add_argument("--cross_attn_mode", type=str, default="global", choices=["global", "windowed"])
     parser.add_argument("--resume_from", type=str, default=None, help="Path to checkpoint to resume from")
-    parser.add_argument("--compression_schedule", type=int, nargs="+", default=[2, 4, 8, 16],
-                        help="Compression ratio schedule (default: 2 4 8 16)")
+    parser.add_argument("--compression_schedule", type=int, nargs="+", default=[1, 2, 4, 8, 16],
+                        help="Compression ratio schedule (default: 1 2 4 8 16)")
     return parser.parse_args()
 
 
