@@ -777,7 +777,8 @@ def evaluate(
                 for cond in conditions:
                     if cond in sample_gens:
                         f1 = compute_f1(sample_gens[cond], gold_answer)
-                        tqdm.write(f"  {cond:<20s}: {sample_gens[cond]!r}  (F1={f1:.2f})")
+                        sub_em = best_subspan_em(sample_gens[cond], [gold_answer])
+                        tqdm.write(f"  {cond:<20s}: {sample_gens[cond]!r}  (F1={f1:.2f}, Sub-EM={sub_em:.0f})")
 
         # Progress bar
         if accum["full_context"][1] > 0:
