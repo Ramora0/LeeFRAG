@@ -13,16 +13,18 @@ class QFormerKVCompressor(nn.Module):
 
     Architecture:
         1. Mean-pool hidden states at 4096-dim → initial queries
-        2. Per-layer learned embeddings condition the shared routing
-        3. V-free cross-attention with relative position bias: small Wq/Wk compute
+        2. Self-attention: queries coordinate to specialize before routing
+        3. Per-layer learned embeddings condition the shared routing
+        4. V-free cross-attention with relative position bias: small Wq/Wk compute
            attention routing weights, raw 4096-dim hidden states are the values (no Wv)
-        4. Gated residual: output = gate * cross_attn + (1-gate) * queries
-        5. SwiGLU FFN with gated residual to break the convex hull of input hidden states
-        6. Frozen copies of the LLM's own k_proj/v_proj produce final KV cache entries
+        5. Gated residual: output = gate * cross_attn + (1-gate) * queries
+        6. SwiGLU FFN with gated residual to break the convex hull of input hidden states
+        7. Frozen copies of the LLM's own k_proj/v_proj produce final KV cache entries
 
     At init with compression_ratio=1:
         - Mean-pool is identity (window size 1)
-        - Gated residual with gate ≈ 0 → output ≈ queries = original hidden states
+        - Self-attention gate ≈ 0 → no-op
+        - Cross-attention gated residual with gate ≈ 0 → output ≈ queries
         - FFN residual gate ≈ 0 → FFN is a no-op
         - Frozen KV projections reproduce the LLM's own KV cache
         → output ≈ LLM's real KV cache
@@ -95,6 +97,12 @@ class QFormerKVCompressor(nn.Module):
         self.register_buffer("frozen_v_proj", v_weights)  # [32, 1024, 4096]
         self.register_buffer("frozen_ln_weight", ln_weights)  # [32, 4096]
 
+        self.cross_attn_mode = config.cross_attn_mode
+
+        # Learned query for chunked cross-attention mode
+        if self.cross_attn_mode == "chunked":
+            self.learned_query = nn.Parameter(torch.randn(1, 1, hidden) * 0.02)
+
         self.gradient_checkpointing = config.gradient_checkpointing
 
     def _cross_attend(
@@ -142,6 +150,54 @@ class QFormerKVCompressor(nn.Module):
         compressed = gate * cross_attn_out + (1.0 - gate) * queries
 
         return compressed
+
+    def _cross_attend_chunked(
+        self,
+        queries: torch.Tensor,
+        chunked_hs: torch.Tensor,
+        layer_emb: torch.Tensor,
+    ) -> torch.Tensor:
+        """Chunked cross-attention: one learned query attends to each chunk independently.
+
+        Args:
+            queries: [num_layers, num_chunks, 4096] (expanded learned query)
+            chunked_hs: [num_layers, num_chunks, chunk_size, 4096]
+            layer_emb: [num_layers, 1, attn_dim]
+
+        Returns:
+            compressed: [num_layers, num_chunks, 4096]
+        """
+        num_layers, num_chunks, chunk_size, _ = chunked_hs.shape
+
+        # Flatten layers and chunks into batch dim for efficient batched attention
+        q_flat = queries.reshape(num_layers * num_chunks, 1, -1)       # [N, 1, 4096]
+        hs_flat = chunked_hs.reshape(num_layers * num_chunks, chunk_size, -1)  # [N, cs, 4096]
+        le_flat = layer_emb.expand(-1, num_chunks, -1).reshape(
+            num_layers * num_chunks, 1, -1
+        )  # [N, 1, attn_dim]
+
+        # Project to attn_dim for routing
+        q = self.cross_q(q_flat) + le_flat  # [N, 1, attn_dim]
+        k = self.cross_k(hs_flat)           # [N, cs, attn_dim]
+
+        scale = q.shape[-1] ** -0.5
+        attn_logits = torch.bmm(q, k.transpose(-2, -1)) * scale  # [N, 1, cs]
+
+        # Relative position bias within each chunk
+        k_pos = torch.arange(chunk_size, device=queries.device, dtype=queries.dtype)
+        k_pos = (k_pos + 0.5) / chunk_size
+        q_pos = torch.tensor([0.5], device=queries.device, dtype=queries.dtype)
+        rel_dist = (q_pos.unsqueeze(1) - k_pos.unsqueeze(0)).abs()  # [1, cs]
+        attn_logits = attn_logits - self.pos_bias_slope * rel_dist
+
+        attn_weights = F.softmax(attn_logits, dim=-1)        # [N, 1, cs]
+        cross_attn_out = torch.bmm(attn_weights, hs_flat)    # [N, 1, 4096]
+
+        # Gated residual: at init gate ≈ 0, output ≈ learned query
+        gate = torch.sigmoid(self.residual_gate)
+        compressed = gate * cross_attn_out + (1.0 - gate) * q_flat
+
+        return compressed.reshape(num_layers, num_chunks, -1)  # [num_layers, num_chunks, 4096]
 
     def _ffn(self, x: torch.Tensor) -> torch.Tensor:
         """Shared SwiGLU FFN with gated residual.
@@ -202,6 +258,17 @@ class QFormerKVCompressor(nn.Module):
         x = self._ffn(x)
         return x
 
+    def _forward_inner_chunked(
+        self,
+        queries: torch.Tensor,
+        chunked_hs: torch.Tensor,
+        layer_emb: torch.Tensor,
+    ) -> torch.Tensor:
+        """Inner forward (chunked mode) for gradient checkpointing."""
+        x = self._cross_attend_chunked(queries, chunked_hs, layer_emb)
+        x = self._ffn(x)
+        return x
+
     def forward(
         self,
         doc_hidden_states: list[torch.Tensor],
@@ -232,24 +299,49 @@ class QFormerKVCompressor(nn.Module):
             # Diagnostic: skip all learnable parameters, just RMSNorm + frozen KV proj
             return self._apply_frozen_kv_proj(all_hs)
 
-        # Mean-pool hidden states: [num_layers, num_queries, 4096]
-        if num_queries == doc_len:
-            pooled = all_hs
-        else:
-            pooled = F.adaptive_avg_pool1d(
-                all_hs.permute(0, 2, 1),
-                num_queries,
-            ).permute(0, 2, 1)
+        if self.cross_attn_mode == "chunked":
+            # Chunked mode: one learned query attends to each chunk_size segment
+            chunk_size = compression_ratio
+            num_chunks = doc_len // chunk_size
+            num_chunks = min(num_chunks, self.max_query_tokens)
+            usable_len = num_chunks * chunk_size
 
-        # V-free cross-attention: learned routing, raw hidden state values
-        if self.gradient_checkpointing and self.training:
-            compressed = checkpoint(
-                self._forward_inner, pooled, all_hs, self.layer_embeddings,
-                use_reentrant=False,
+            # Reshape into chunks: [num_layers, num_chunks, chunk_size, 4096]
+            chunked_hs = all_hs[:, :usable_len].reshape(
+                self.num_layers, num_chunks, chunk_size, -1
             )
+
+            # Expand learned query: [1, 1, 4096] → [num_layers, num_chunks, 4096]
+            queries = self.learned_query.expand(self.num_layers, num_chunks, -1)
+
+            if self.gradient_checkpointing and self.training:
+                compressed = checkpoint(
+                    self._forward_inner_chunked, queries, chunked_hs, self.layer_embeddings,
+                    use_reentrant=False,
+                )
+            else:
+                compressed = self._cross_attend_chunked(queries, chunked_hs, self.layer_embeddings)
+                compressed = self._ffn(compressed)
         else:
-            compressed = self._cross_attend(pooled, all_hs, self.layer_embeddings)
-            compressed = self._ffn(compressed)
+            # Global mode: mean-pooled queries attend to entire sequence
+            # Mean-pool hidden states: [num_layers, num_queries, 4096]
+            if num_queries == doc_len:
+                pooled = all_hs
+            else:
+                pooled = F.adaptive_avg_pool1d(
+                    all_hs.permute(0, 2, 1),
+                    num_queries,
+                ).permute(0, 2, 1)
+
+            # V-free cross-attention: learned routing, raw hidden state values
+            if self.gradient_checkpointing and self.training:
+                compressed = checkpoint(
+                    self._forward_inner, pooled, all_hs, self.layer_embeddings,
+                    use_reentrant=False,
+                )
+            else:
+                compressed = self._cross_attend(pooled, all_hs, self.layer_embeddings)
+                compressed = self._ffn(compressed)
 
         # Apply frozen LLM KV projections
         return self._apply_frozen_kv_proj(compressed)

@@ -21,6 +21,7 @@ class QFormerConfig:
     attn_dim: int = 256  # projection dim for cross-attention routing (small — only computes weights)
     ffn_dim: int = 1024  # SwiGLU intermediate dim (4096 → 1024 → 4096, ~12M params)
     max_query_tokens: int = 512
+    cross_attn_mode: str = "global"  # "global" (mean-pooled queries attend all) or "chunked" (one query per chunk)
     gradient_checkpointing: bool = False
 
 

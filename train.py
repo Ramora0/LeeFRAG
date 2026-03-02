@@ -56,6 +56,8 @@ def parse_args():
     parser.add_argument("--resume_from", type=str, default=None, help="Path to checkpoint to resume from")
     parser.add_argument("--compression_schedule", type=int, nargs="+", default=[1, 2, 4, 8, 16],
                         help="Compression ratio schedule (default: 1 2 4 8 16)")
+    parser.add_argument("--cross_attn_mode", type=str, default="global", choices=["global", "chunked"],
+                        help="Cross-attention mode: 'global' (pooled queries attend all) or 'chunked' (one query per chunk)")
     return parser.parse_args()
 
 
@@ -84,7 +86,7 @@ def main():
         compression_schedule=args.compression_schedule,
     )
 
-    qformer_config = QFormerConfig()
+    qformer_config = QFormerConfig(cross_attn_mode=args.cross_attn_mode)
 
     set_seed(training_config.seed)
     os.makedirs(training_config.output_dir, exist_ok=True)
@@ -114,7 +116,10 @@ def main():
     # Build Q-Former (pass LLM so frozen KV projections are copied)
     logger.info("Building Q-Former KV compressor")
     qformer = QFormerKVCompressor(qformer_config, model_config, llm=model).to(device)
-    qformer._cross_attend = torch.compile(qformer._cross_attend, dynamic=True)
+    if qformer_config.cross_attn_mode == "chunked":
+        qformer._cross_attend_chunked = torch.compile(qformer._cross_attend_chunked, dynamic=True)
+    else:
+        qformer._cross_attend = torch.compile(qformer._cross_attend, dynamic=True)
     trainable_params = sum(p.numel() for p in qformer.parameters() if p.requires_grad)
     logger.info(f"Q-Former trainable params: {trainable_params / 1e6:.1f}M")
 
