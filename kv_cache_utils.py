@@ -10,12 +10,16 @@ def extract_doc_hidden_states(
 ) -> list[list[torch.Tensor]]:
     """Extract per-document hidden states from a concatenated forward pass.
 
+    Returns the INPUT to each LLM layer (not the output), since the KV cache
+    at layer i is computed from layer i's input.
+
     Args:
         all_hidden_states: Tuple of hidden states per layer from model output.
             Each shape: [batch, total_seq_len, hidden_size].
-            Index 0 is embedding output; indices 1..num_layers are layer outputs.
+            Index 0 is embedding output (= input to layer 0).
+            Index i is output of layer i-1 (= input to layer i).
         doc_lengths: Token count for each document.
-        num_layers: Number of LLM layers (we use indices 1..num_layers).
+        num_layers: Number of LLM layers (we use indices 0..num_layers-1).
 
     Returns:
         List of per-document hidden states. Each document is a list of
@@ -26,8 +30,8 @@ def extract_doc_hidden_states(
 
     for doc_len in doc_lengths:
         doc_hs = []
-        # Skip index 0 (embedding output), use layer outputs 1..num_layers
-        for layer_idx in range(1, num_layers + 1):
+        # Index i = input to LLM layer i (embedding for i=0, output of layer i-1 otherwise)
+        for layer_idx in range(num_layers):
             hs = all_hidden_states[layer_idx][:, offset : offset + doc_len, :]
             doc_hs.append(hs)
         per_doc_hidden.append(doc_hs)

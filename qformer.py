@@ -265,6 +265,9 @@ class QFormerKVCompressor(nn.Module):
         self.model_config = model_config
         self.num_layers = model_config.num_layers
 
+        # RMSNorm before projection (matches LLM's input_layernorm)
+        self.input_norm = nn.RMSNorm(model_config.hidden_size)
+
         # Project mean-pooled hidden states to Q-Former dim
         self.input_proj = nn.Linear(model_config.hidden_size, config.hidden_size, bias=False)
 
@@ -301,12 +304,18 @@ class QFormerKVCompressor(nn.Module):
         device = self.input_proj.weight.device
         dtype = self.input_proj.weight.dtype
 
-        # Collect per-layer K/V projection weights: each [kv_dim, hidden_size]
+        # Collect per-layer K/V projection weights with RMSNorm gamma folded in.
+        # LLM computes K = k_proj(RMSNorm(x)) = k_proj(gamma * x / rms(x))
+        # We fold gamma into the weight: W_k_eff = W_k @ diag(gamma)
+        # The 1/rms(x) normalization is input-dependent and handled separately.
         all_k_weights = []
         all_v_weights = []
         for layer in llm.model.layers:
-            all_k_weights.append(layer.self_attn.k_proj.weight.detach().float())
-            all_v_weights.append(layer.self_attn.v_proj.weight.detach().float())
+            gamma = layer.input_layernorm.weight.detach().float()  # [hidden_size]
+            wk = layer.self_attn.k_proj.weight.detach().float()   # [kv_dim, hidden_size]
+            wv = layer.self_attn.v_proj.weight.detach().float()
+            all_k_weights.append(wk * gamma.unsqueeze(0))  # broadcast: [kv_dim, hidden_size]
+            all_v_weights.append(wv * gamma.unsqueeze(0))
 
         # [num_layers, kv_dim, llm_hidden_size]
         Wk = torch.stack(all_k_weights)
@@ -398,8 +407,8 @@ class QFormerKVCompressor(nn.Module):
             num_queries,
         ).permute(0, 2, 1)  # [num_layers, num_queries, 4096]
 
-        # Project to Q-Former dim: [num_layers, num_queries, hidden_size]
-        queries = self.input_proj(pooled)
+        # RMSNorm + project to Q-Former dim: [num_layers, num_queries, hidden_size]
+        queries = self.input_proj(self.input_norm(pooled))
 
         # Condition with per-layer embeddings
         queries = queries + self.layer_embeddings
