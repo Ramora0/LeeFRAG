@@ -19,7 +19,6 @@ class ModelConfig:
 @dataclass
 class QFormerConfig:
     attn_dim: int = 256  # projection dim for cross-attention routing (small — only computes weights)
-    num_routing_heads: int = 8  # number of heads for attention routing
     max_query_tokens: int = 512
     gradient_checkpointing: bool = False
 

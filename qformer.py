@@ -51,15 +51,9 @@ class QFormerKVCompressor(nn.Module):
         with torch.no_grad():
             self.cross_k.weight.copy_(self.cross_q.weight)
 
-        # Multi-head attention parameters for routing
-        self.num_routing_heads = config.num_routing_heads
-        self.routing_head_dim = attn_dim // config.num_routing_heads
-
-        # Relative position bias: per-head learnable slope (ALiBi-style)
+        # Relative position bias: learnable slope (ALiBi-style)
         # Initialized to favor nearby positions; learned during training
-        self.pos_bias_slopes = nn.Parameter(
-            torch.linspace(1.0, 4.0, config.num_routing_heads)
-        )
+        self.pos_bias_slope = nn.Parameter(torch.tensor(2.0))
 
         # Gated residual: sigmoid(-5) ≈ 0.007, so output ≈ queries at init
         self.residual_gate = nn.Parameter(torch.tensor(-5.0))
@@ -115,33 +109,20 @@ class QFormerKVCompressor(nn.Module):
         q = self.cross_q(queries) + layer_emb  # [B, Q, attn_dim]
         k = self.cross_k(hidden_states)  # [B, D, attn_dim]
 
-        # Multi-head: reshape to [B, heads, seq, head_dim]
-        q = q.view(batch, num_q, self.num_routing_heads, self.routing_head_dim).transpose(1, 2)
-        k = k.view(batch, kv_len, self.num_routing_heads, self.routing_head_dim).transpose(1, 2)
+        # Attention scores: [B, Q, D]
+        scale = q.shape[-1] ** -0.5
+        attn_logits = torch.bmm(q, k.transpose(-2, -1)) * scale
 
-        # Attention scores: [B, heads, Q, D]
-        scale = self.routing_head_dim ** -0.5
-        attn_logits = torch.matmul(q, k.transpose(-2, -1)) * scale
-
-        # Relative position bias: ALiBi-style distance penalty per head
+        # Relative position bias: ALiBi-style distance penalty
         # Positions normalized to [0, 1] so bias is doc-length-invariant
         q_pos = torch.arange(num_q, device=queries.device, dtype=queries.dtype)
         k_pos = torch.arange(kv_len, device=queries.device, dtype=queries.dtype)
-        # Normalize: query positions map to center of their pooling window
         q_pos = (q_pos + 0.5) / num_q
         k_pos = (k_pos + 0.5) / kv_len
-        # Absolute distance: [Q, D]
-        rel_dist = (q_pos.unsqueeze(1) - k_pos.unsqueeze(0)).abs()
-        # Per-head slopes: [heads, 1, 1] * [Q, D] → [heads, Q, D]
-        pos_bias = -self.pos_bias_slopes.view(-1, 1, 1) * rel_dist.unsqueeze(0)
-        attn_logits = attn_logits + pos_bias.unsqueeze(0)  # broadcast over batch
+        rel_dist = (q_pos.unsqueeze(1) - k_pos.unsqueeze(0)).abs()  # [Q, D]
+        attn_logits = attn_logits - self.pos_bias_slope * rel_dist
 
-        attn_weights = F.softmax(attn_logits, dim=-1)
-
-        # Apply weights to raw hidden states (no V projection)
-        # All heads share the same values (raw hidden states), so average the
-        # attention weights across heads first for efficiency
-        attn_weights = attn_weights.mean(dim=1)  # [B, Q, D]
+        attn_weights = F.softmax(attn_logits, dim=-1)  # [B, Q, D]
         cross_attn_out = torch.bmm(attn_weights, hidden_states)  # [B, Q, 4096]
 
         # Gated residual: at init gate ≈ 0, output ≈ queries (identity)
