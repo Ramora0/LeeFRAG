@@ -68,8 +68,6 @@ class QFormerKVCompressor(nn.Module):
         self.ffn_down = nn.Linear(ffn_dim, hidden, bias=False)
         # Zero-init output so FFN is a no-op at start
         nn.init.zeros_(self.ffn_down.weight)
-        # FFN gated residual (separate from cross-attn gate)
-        self.ffn_residual_gate = nn.Parameter(torch.tensor(-3.0))
 
         # Frozen per-layer KV projections from the LLM
         # Shape: [num_layers, kv_dim, hidden] (transposed for F.linear)
@@ -228,8 +226,7 @@ class QFormerKVCompressor(nn.Module):
             output: [num_layers, num_queries, 4096]
         """
         ffn_out = self.ffn_down(F.silu(self.ffn_gate(x)) * self.ffn_up(x))
-        gate = torch.sigmoid(self.ffn_residual_gate)
-        return gate * ffn_out + residual
+        return residual + ffn_out
 
     def _apply_frozen_kv_proj(
         self, compressed: torch.Tensor,

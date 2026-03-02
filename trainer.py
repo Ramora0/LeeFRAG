@@ -165,12 +165,10 @@ class TwoStageTrainer:
                     phase = self.compression_scheduler.get_phase(global_step)
                     use_hs = self.training_config.hidden_state_loss
                     secondary_tag = "hs" if use_hs else "kl"
-                    ffn_gate_val = torch.sigmoid(self.qformer.ffn_residual_gate).item()
                     postfix = dict(
                         loss=f"{avg_loss:.4f}",
                         ce=f"{avg_ce:.4f}",
                         **{secondary_tag: f"{avg_kl:.4f}"},
-                        ffn_gate=f"{ffn_gate_val:.4f}",
                         lr=f"{lr:.2e}",
                         comp=f"{compression_ratio}x",
                         step=f"{global_step}/{self.total_steps}",
@@ -188,7 +186,6 @@ class TwoStageTrainer:
                                 "train/loss": avg_loss,
                                 "train/ce_loss": avg_ce,
                                 secondary_key: avg_kl,
-                                "train/ffn_gate": ffn_gate_val,
                                 "train/lr": lr,
                                 "train/compression_ratio": compression_ratio,
                                 "train/empirical_compression_ratio": avg_empirical_ratio,
