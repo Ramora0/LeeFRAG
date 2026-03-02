@@ -90,6 +90,7 @@ def main():
 
     qformer_config = QFormerConfig(
         attn_dim=256 * args.scale,
+        num_attn_heads=8 * args.scale,
         ffn_dim=256 * args.scale,
         cross_attn_mode=args.cross_attn_mode,
     )

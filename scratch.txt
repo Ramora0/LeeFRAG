@@ -1,4 +1,11 @@
 python train.py --dataset hotpotqa --compression_schedule 16 --hidden_state_loss --hidden_state_weight 10.0 
 
-more attn
-16x
+32x
+no hidden_state_loss
+
+
+Compression scheduling?
+Learning rate
+
+
+More data
