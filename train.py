@@ -58,6 +58,8 @@ def parse_args():
                         help="Compression ratio schedule (default: 1 2 4 8 16)")
     parser.add_argument("--cross_attn_mode", type=str, default="global", choices=["global", "chunked"],
                         help="Cross-attention mode: 'global' (pooled queries attend all) or 'chunked' (one query per chunk)")
+    parser.add_argument("--scale", type=int, default=1,
+                        help="Scale factor for Q-Former attn_dim and ffn_dim (default: 1)")
     return parser.parse_args()
 
 
@@ -86,7 +88,11 @@ def main():
         compression_schedule=args.compression_schedule,
     )
 
-    qformer_config = QFormerConfig(cross_attn_mode=args.cross_attn_mode)
+    qformer_config = QFormerConfig(
+        attn_dim=256 * args.scale,
+        ffn_dim=256 * args.scale,
+        cross_attn_mode=args.cross_attn_mode,
+    )
 
     set_seed(training_config.seed)
     os.makedirs(training_config.output_dir, exist_ok=True)
