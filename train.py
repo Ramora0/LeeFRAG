@@ -126,20 +126,16 @@ def verify_identity_passthrough(model, qformer, train_loader, model_config, devi
     def _eval_cache(cache, label):
         prefix_len = cache.get_seq_length()
         qa_len = stage_b_input_ids.shape[1]
-        # Explicitly pass position_ids and attention_mask to avoid
-        # HF auto-computation bugs with past_key_values + SDPA
-        position_ids = torch.arange(
-            prefix_len, prefix_len + qa_len, device=device,
-        ).unsqueeze(0)
-        attention_mask = torch.ones(
-            1, prefix_len + qa_len, device=device, dtype=torch.long,
+        # Must pass explicit 4D prefix-causal mask — HF's auto-generated mask
+        # is wrong when past_key_values is provided with multi-token input + SDPA.
+        attn_mask = build_prefix_causal_mask(
+            prefix_len, qa_len, dtype=torch.float16, device=device,
         )
         with torch.amp.autocast("cuda"):
             out = model(
                 input_ids=stage_b_input_ids,
                 past_key_values=cache,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
+                attention_mask=attn_mask,
                 use_cache=False,
             )
         logits = out.logits

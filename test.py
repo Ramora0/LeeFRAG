@@ -147,10 +147,19 @@ def compute_ce(logits, labels):
 
 def forward_with_cache(model, input_ids, labels, past_key_values):
     """Run LLM forward with a given KV cache prefix."""
+    from block_attention import build_prefix_causal_mask
+
+    prefix_len = past_key_values.get_seq_length()
+    seq_len = input_ids.shape[1]
+    device = input_ids.device
+    attn_mask = build_prefix_causal_mask(
+        prefix_len, seq_len, dtype=torch.float16, device=device,
+    )
     with torch.amp.autocast("cuda"):
         outputs = model(
             input_ids=input_ids,
             past_key_values=past_key_values,
+            attention_mask=attn_mask,
             use_cache=False,
         )
     return compute_ce(outputs.logits, labels)

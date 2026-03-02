@@ -9,7 +9,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, PreTrainedTokenizer
 
 from config import ModelConfig, QFormerConfig, TrainingConfig
-from block_attention import build_block_causal_mask_with_qa
+from block_attention import build_block_causal_mask_with_qa, build_prefix_causal_mask
 from kv_cache_utils import apply_rope_to_cache, concat_compressed_caches, extract_doc_hidden_states
 from qformer import QFormerKVCompressor
 from scheduler import CompressionScheduler
@@ -403,14 +403,20 @@ class TwoStageTrainer:
             compressed_cache, self.model_config.num_layers, rotary_emb
         )
 
-        # Forward through frozen LLM with compressed KV prefix
-        # No explicit attention_mask: HF generates the correct prefix-causal
-        # pattern from past_key_values (full attn to prefix + causal among new
-        # tokens). Omitting it lets SDPA use the FlashAttention backend.
+        # Forward through frozen LLM with compressed KV prefix.
+        # Must pass explicit 4D prefix-causal mask — HF's auto-generated mask
+        # is wrong when past_key_values + multi-token input + SDPA.
+        prefix_len = compressed_cache.get_seq_length()
+        seq_len = input_ids.shape[1]
+        dtype = torch.float16 if self.training_config.fp16 else torch.float32
+        prefix_mask = build_prefix_causal_mask(
+            prefix_len, seq_len, dtype=dtype, device=self.device,
+        )
         use_hs_loss = self.training_config.hidden_state_loss
         outputs = self.model(
             input_ids=input_ids,
             past_key_values=compressed_cache,
+            attention_mask=prefix_mask,
             use_cache=False,
             output_hidden_states=use_hs_loss,
         )
@@ -595,9 +601,16 @@ class TwoStageTrainer:
                 )
 
                 use_hs_loss = self.training_config.hidden_state_loss
+                prefix_len = compressed_cache.get_seq_length()
+                seq_len = stage_b_input_ids.shape[1]
+                dtype = torch.float16 if self.training_config.fp16 else torch.float32
+                eval_prefix_mask = build_prefix_causal_mask(
+                    prefix_len, seq_len, dtype=dtype, device=self.device,
+                )
                 outputs = self.model(
                     input_ids=stage_b_input_ids,
                     past_key_values=compressed_cache,
+                    attention_mask=eval_prefix_mask,
                     use_cache=False,
                     output_hidden_states=use_hs_loss,
                 )
