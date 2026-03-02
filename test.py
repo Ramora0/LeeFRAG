@@ -441,7 +441,10 @@ def run_pipeline_diagnostic(
         "two_pass_bypass",
         "two_pass_qformer",
     ]
+    # Token-weighted (micro) accumulators: [loss_sum, n_tokens]
     accum = {v: [0.0, 0] for v in variants}
+    # Batch-averaged (macro) accumulators: [ce_sum, n_batches]
+    macro = {v: [0.0, 0] for v in variants}
 
     n = min(len(dataset), max_samples)
     pbar = tqdm(range(n), desc="Pipeline diagnostic")
@@ -506,14 +509,21 @@ def run_pipeline_diagnostic(
                 )
             return compute_ce(out.logits, stage_b_labels)
 
+        def _accum(name, result):
+            """Accumulate both token-weighted (micro) and batch-averaged (macro)."""
+            loss_sum, n_tok = result
+            accum[name][0] += loss_sum
+            accum[name][1] += n_tok
+            macro[name][0] += loss_sum / n_tok  # per-batch mean CE
+            macro[name][1] += 1
+
         # --- 1. Single pass full causal ---
         with torch.amp.autocast("cuda"):
             out_causal = model(input_ids=full_input, use_cache=False)
         result = _ce_from_logits(out_causal.logits, full_labels)
         if result is None:
             continue
-        accum["full_causal"][0] += result[0]
-        accum["full_causal"][1] += result[1]
+        _accum("full_causal", result)
 
         # --- 2. Single pass block mask (Stage A teacher) ---
         attn_mask = build_block_causal_mask_with_qa(
@@ -528,8 +538,7 @@ def run_pipeline_diagnostic(
             )
         result = _ce_from_logits(outputs_a.logits, full_labels)
         if result:
-            accum["block_mask"][0] += result[0]
-            accum["block_mask"][1] += result[1]
+            _accum("block_mask", result)
 
         # Extract hidden states for variants 4 and 5
         per_doc_hidden = extract_doc_hidden_states(
@@ -543,8 +552,7 @@ def run_pipeline_diagnostic(
         real_cache = real_outputs.past_key_values
         result = _eval_cache(real_cache)
         if result:
-            accum["two_pass_real_kv"][0] += result[0]
-            accum["two_pass_real_kv"][1] += result[1]
+            _accum("two_pass_real_kv", result)
 
         # --- 4. Two-pass bypass (block-diag hs → RMSNorm → frozen KV proj → RoPE) ---
         with torch.amp.autocast("cuda"):
@@ -556,8 +564,7 @@ def run_pipeline_diagnostic(
             bypass_cache = apply_rope_to_cache(bypass_cache, model_config.num_layers, rotary_emb)
         result = _eval_cache(bypass_cache)
         if result:
-            accum["two_pass_bypass"][0] += result[0]
-            accum["two_pass_bypass"][1] += result[1]
+            _accum("two_pass_bypass", result)
 
         # --- 5. Two-pass Q-Former at ratio 1 ---
         with torch.amp.autocast("cuda"):
@@ -569,8 +576,7 @@ def run_pipeline_diagnostic(
             qf_cache = apply_rope_to_cache(qf_cache, model_config.num_layers, rotary_emb)
         result = _eval_cache(qf_cache)
         if result:
-            accum["two_pass_qformer"][0] += result[0]
-            accum["two_pass_qformer"][1] += result[1]
+            _accum("two_pass_qformer", result)
 
         # Progress bar
         if accum["full_causal"][1] > 0:
@@ -593,19 +599,32 @@ def run_pipeline_diagnostic(
         "two_pass_qformer": "5. Two-pass Q-Former",
     }
 
+    logger.info(f"  {'Variant':30s}  {'micro (token-wtd)':>18s}  {'macro (batch-avg)':>18s}  {'gap':>6s}")
+    logger.info(f"  {'-'*30}  {'-'*18}  {'-'*18}  {'-'*6}")
+
     results = {}
+    results_macro = {}
     for v in variants:
         loss_sum, n_tok = accum[v]
+        macro_sum, n_batches = macro[v]
         if n_tok == 0:
             logger.info(f"  {labels[v]:30s}  --no valid tokens--")
             continue
-        ce = loss_sum / n_tok
-        ppl = math.exp(ce)
-        results[v] = ce
-        logger.info(f"  {labels[v]:30s}  CE={ce:.4f}  PPL={ppl:.2f}  ({n_tok} tokens)")
+        ce_micro = loss_sum / n_tok
+        ce_macro = macro_sum / n_batches
+        gap = ce_macro - ce_micro
+        results[v] = ce_micro
+        results_macro[v] = ce_macro
+        logger.info(
+            f"  {labels[v]:30s}  CE={ce_micro:.4f} ppl={math.exp(ce_micro):.2f}"
+            f"  CE={ce_macro:.4f} ppl={math.exp(ce_macro):.2f}"
+            f"  {gap:+.2f}"
+        )
 
     logger.info("")
-    logger.info("  Interpretation:")
+    logger.info(f"  Token-weighted averages {accum[variants[0]][1]} total tokens across {macro[variants[0]][1]} samples")
+    logger.info("")
+    logger.info("  Interpretation (token-weighted):")
     if "full_causal" in results and "block_mask" in results:
         d = results["block_mask"] - results["full_causal"]
         logger.info(f"    1→2 (+{d:.4f}): block mask cost (expected small)")

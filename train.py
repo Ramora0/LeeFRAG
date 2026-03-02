@@ -2,21 +2,17 @@
 
 import argparse
 import logging
-import math
 import os
 import random
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from config import ModelConfig, QFormerConfig, TrainingConfig
 from collator import RAGCollator
 from dataset import create_dataset
-from kv_cache_utils import apply_rope_to_cache, concat_compressed_caches, extract_doc_hidden_states
-from block_attention import build_block_causal_mask_with_qa, build_prefix_causal_mask
 from qformer import QFormerKVCompressor
 from trainer import TwoStageTrainer
 
@@ -61,85 +57,6 @@ def parse_args():
     parser.add_argument("--compression_schedule", type=int, nargs="+", default=[1, 2, 4, 8, 16],
                         help="Compression ratio schedule (default: 1 2 4 8 16)")
     return parser.parse_args()
-
-
-@torch.no_grad()
-def verify_identity_passthrough(model, qformer, train_loader, model_config, device):
-    """Quick single-sample sanity check: bypass vs Q-Former at ratio 1.
-
-    For a full multi-sample pipeline diagnostic, run: python test.py pipeline
-    """
-    qformer.eval()
-    batch = next(iter(train_loader))
-
-    doc_token_ids = batch["doc_token_ids"]
-    doc_lengths = batch["doc_lengths"]
-    preamble_ids = batch["preamble_ids"]
-    stage_b_input_ids = batch["stage_b_input_ids"].to(device)
-    stage_b_labels = batch["stage_b_labels"].to(device)
-
-    if not doc_token_ids or sum(doc_lengths) == 0:
-        logger.warning("Identity test: empty batch, skipping")
-        return
-
-    preamble_len = preamble_ids.shape[0]
-    block_lengths = [preamble_len + doc_lengths[0]] + doc_lengths[1:]
-
-    # Stage A: get hidden states
-    doc_concat = torch.cat(doc_token_ids, dim=0).unsqueeze(0).to(device)
-    preamble = preamble_ids.unsqueeze(0).to(device)
-    full_input = torch.cat([preamble, doc_concat, stage_b_input_ids], dim=1)
-    qa_length = stage_b_input_ids.shape[1]
-
-    attn_mask = build_block_causal_mask_with_qa(
-        block_lengths, qa_length, dtype=torch.float16, device=device,
-    )
-    outputs_a = model(
-        input_ids=full_input, attention_mask=attn_mask,
-        output_hidden_states=True, use_cache=False,
-    )
-    per_doc_hidden = extract_doc_hidden_states(
-        outputs_a.hidden_states, block_lengths, model_config.num_layers,
-    )
-    rotary_emb = model.model.rotary_emb
-
-    def _build_and_eval(bypass_mode, label):
-        with torch.amp.autocast("cuda"):
-            per_doc_compressed = [
-                qformer(doc_hs, compression_ratio=1, bypass=bypass_mode)
-                for doc_hs in per_doc_hidden
-            ]
-            cache = concat_compressed_caches(per_doc_compressed, model_config.num_layers)
-            cache = apply_rope_to_cache(cache, model_config.num_layers, rotary_emb)
-
-        prefix_len = cache.get_seq_length()
-        mask = build_prefix_causal_mask(
-            prefix_len, stage_b_input_ids.shape[1],
-            dtype=torch.float16, device=device,
-        )
-        with torch.amp.autocast("cuda"):
-            out = model(
-                input_ids=stage_b_input_ids, past_key_values=cache,
-                attention_mask=mask, use_cache=False,
-            )
-        shift_logits = out.logits[:, :-1, :].contiguous()
-        shift_labels = stage_b_labels[:, 1:].contiguous()
-        ce = F.cross_entropy(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1), ignore_index=-100,
-        ).item()
-        n_valid = (shift_labels != -100).sum().item()
-        logger.info(f"  {label}: CE={ce:.4f} (ppl={math.exp(ce):.2f}), n_tokens={n_valid}")
-        return ce
-
-    logger.info("Identity passthrough (single sample):")
-    bypass_ce = _build_and_eval(bypass_mode=True, label="Bypass")
-    qformer_ce = _build_and_eval(bypass_mode=False, label="Q-Former")
-    delta = qformer_ce - bypass_ce
-    logger.info(f"  Delta (Q-Former - Bypass): {delta:+.4f}")
-    logger.info("  (For full multi-sample diagnostic: python test.py pipeline)")
-
-    qformer.train()
 
 
 def main():
@@ -260,19 +177,6 @@ def main():
         if "scaler_state_dict" in ckpt:
             trainer.scaler.load_state_dict(ckpt["scaler_state_dict"])
         logger.info(f"Resumed from step {ckpt.get('step', '?')}")
-
-    # Test how close Q-Former is to identity at ratio 1
-    logger.info("Running identity passthrough test...")
-    verify_identity_passthrough(model, qformer, train_loader, model_config, device)
-
-    # Verify gradient flow on first step
-    logger.info("Running gradient flow verification...")
-    sample_batch = next(iter(train_loader))
-    loss = trainer._training_step(sample_batch, compression_ratio=2, global_step=0)
-    if loss is not None:
-        loss.backward()
-        trainer.verify_gradient_flow()
-        trainer.optimizer.zero_grad()
 
     # Train
     logger.info("Starting training...")
