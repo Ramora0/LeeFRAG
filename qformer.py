@@ -53,9 +53,8 @@ class QFormerKVCompressor(nn.Module):
         self.cross_k = nn.Linear(hidden, attn_dim, bias=False)
         self.cross_v = nn.Linear(hidden, attn_dim, bias=False)
         self.cross_out = nn.Linear(attn_dim, hidden, bias=False)
-
-        # Cross-attention gated residual
-        self.residual_gate = nn.Parameter(torch.tensor(-3.0))
+        # Zero-init output so cross-attention is a no-op at start
+        nn.init.zeros_(self.cross_out.weight)
 
         # Per-head ALiBi slopes for relative position bias
         self.pos_bias_slopes = nn.Parameter(
@@ -157,9 +156,8 @@ class QFormerKVCompressor(nn.Module):
         attn_out = attn_out.transpose(1, 2).reshape(B, num_q, -1)  # [B, Q, attn_dim]
         cross_attn_out = self.cross_out(attn_out)  # [B, Q, 4096]
 
-        # Gated residual
-        gate = torch.sigmoid(self.residual_gate)
-        return gate * cross_attn_out + (1.0 - gate) * queries
+        # Residual: cross_out is zero-init so this starts as identity
+        return queries + cross_attn_out
 
     def _cross_attend_chunked(
         self,
@@ -216,10 +214,8 @@ class QFormerKVCompressor(nn.Module):
         attn_out = attn_out.transpose(1, 2).reshape(N, 1, -1)  # [N, 1, attn_dim]
         cross_attn_out = self.cross_out(attn_out)  # [N, 1, 4096]
 
-        # Gated residual
-        gate = torch.sigmoid(self.residual_gate)
-        result = gate * cross_attn_out + (1.0 - gate) * q_flat
-        return result.reshape(num_layers, num_chunks, -1)
+        # Residual
+        return (q_flat + cross_attn_out).reshape(num_layers, num_chunks, -1)
 
     def _ffn(self, x: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
         """Shared SwiGLU FFN with gated residual back to original queries.
