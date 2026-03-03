@@ -65,8 +65,7 @@ class TwoStageTrainer:
         if training_config.eval_steps is None:
             training_config.eval_steps = max(1, steps_per_epoch // 3)
 
-        # LR scheduler
-        self.warmup_steps = int(self.total_steps * training_config.warmup_ratio)
+        # LR scheduler (per-phase warm restarts)
 
         # Compression scheduler
         self.compression_scheduler = CompressionScheduler(
@@ -107,10 +106,20 @@ class TwoStageTrainer:
                 desc=f"Epoch {epoch+1}/{self.training_config.num_epochs}",
                 leave=True,
             )
+            prev_phase = -1
             for batch_idx, batch in enumerate(pbar):
                 compression_ratio = self.compression_scheduler.get_compression_ratio(
                     global_step
                 )
+
+                # Log phase transitions
+                phase = self.compression_scheduler.get_phase(global_step)
+                if phase != prev_phase:
+                    logger.info(
+                        f"Phase {phase}: compression={compression_ratio}x, "
+                        f"LR warm-restart at step {global_step}"
+                    )
+                    prev_phase = phase
 
                 loss = self._training_step(batch, compression_ratio, global_step)
 
@@ -537,11 +546,16 @@ class TwoStageTrainer:
         return kl
 
     def _update_lr(self, step: int):
-        """Update learning rate with linear warmup + cosine decay."""
-        if step < self.warmup_steps:
-            lr_scale = step / max(1, self.warmup_steps)
+        """Update learning rate with per-phase warm restart (linear warmup + cosine decay)."""
+        steps_per_phase = self.compression_scheduler.steps_per_phase
+        phase = self.compression_scheduler.get_phase(step)
+        phase_step = step - phase * steps_per_phase
+        phase_warmup = int(steps_per_phase * self.training_config.warmup_ratio)
+
+        if phase_step < phase_warmup:
+            lr_scale = phase_step / max(1, phase_warmup)
         else:
-            progress = (step - self.warmup_steps) / max(1, self.total_steps - self.warmup_steps)
+            progress = (phase_step - phase_warmup) / max(1, steps_per_phase - phase_warmup)
             lr_scale = 0.5 * (1.0 + math.cos(math.pi * progress))
 
         for param_group in self.optimizer.param_groups:

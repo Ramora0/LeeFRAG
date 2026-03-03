@@ -39,7 +39,7 @@ class TrainingConfig:
     adam_beta2: float = 0.95
     warmup_ratio: float = 0.05
     max_grad_norm: float = 1.0
-    compression_schedule: list[int] = field(default_factory=lambda: [1, 2, 4, 8, 16])
+    compression_schedule: list[int] = field(default_factory=lambda: [2, 4, 8, 16])
     eval_split_ratio: float = 0.1
     eval_steps: int = None  # auto: steps_per_epoch // 3
     save_steps: int = 500
