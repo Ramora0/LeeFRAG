@@ -37,7 +37,7 @@ def main():
 
     print(f"Loading model: {cfg.model_name}")
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     model = AutoModelForCausalLM.from_pretrained(
         cfg.model_name,
         torch_dtype=torch.float16,
