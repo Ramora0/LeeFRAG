@@ -36,7 +36,7 @@ echo "Clone complete. Branch: $(cd "$CODE_LOCAL" && git branch --show-current)"
 echo "Commit: $(cd "$CODE_LOCAL" && git rev-parse --short HEAD)"
 
 # Activate python env
-source "$HOME/personal/LeeFRAG/.venv/bin/activate"
+source "$HOME/personal/LeeFRAG/.h100/bin/activate"
 
 cd "$CODE_LOCAL"
 
