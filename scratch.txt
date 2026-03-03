@@ -1,5 +1,6 @@
 python train.py --dataset hotpotqa --compression_schedule 16 --hidden_state_loss --hidden_state_weight 10.0  --scale 4
 python train.py --compression_schedule 16 --layer_adapter_rank 8
+python train.py --num_epochs 1 --layer_adapter_rank 8
 
 32x
 no hidden_state_loss

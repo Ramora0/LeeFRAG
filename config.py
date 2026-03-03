@@ -41,7 +41,7 @@ class TrainingConfig:
     max_grad_norm: float = 1.0
     compression_schedule: list[int] = field(default_factory=lambda: [2, 4, 8, 16])
     eval_split_ratio: float = 0.1
-    eval_steps: int = None  # auto: steps_per_epoch // 3
+    eval_steps: int = None  # auto: steps_per_epoch // 4
     save_steps: int = 500
     logging_steps: int = 10
     seed: int = 42

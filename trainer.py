@@ -61,9 +61,9 @@ class TwoStageTrainer:
         self.total_steps = steps_per_epoch * training_config.num_epochs
         self.steps_per_epoch = steps_per_epoch
 
-        # Auto-compute eval_steps: 3 times per epoch if not explicitly set
+        # Auto-compute eval_steps: 4 times per epoch if not explicitly set
         if training_config.eval_steps is None:
-            training_config.eval_steps = max(1, steps_per_epoch // 3)
+            training_config.eval_steps = max(1, steps_per_epoch // 4)
 
         # LR scheduler (per-phase warm restarts)
 
