@@ -56,3 +56,11 @@ class TrainingConfig:
     hidden_state_layers: str = "all"  # "all" or "last_N" (e.g. "last_8")
     gradient_checkpoint_llm: bool = False
     offload_stage_a_to_cpu: bool = False
+    # LoRA
+    lora: bool = False
+    lora_rank: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.05
+    lora_target_modules: list[str] = field(
+        default_factory=lambda: ["q_proj", "v_proj"]
+    )

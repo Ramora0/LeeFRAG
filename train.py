@@ -62,6 +62,13 @@ def parse_args():
                         help="Scale factor for Q-Former attn_dim and ffn_dim (default: 1)")
     parser.add_argument("--layer_adapter_rank", type=int, default=0,
                         help="Per-layer low-rank adapter rank (0=disabled, try 8)")
+    parser.add_argument("--lora", action="store_true",
+                        help="Train the LLM with LoRA adapters alongside Q-Former")
+    parser.add_argument("--lora_rank", type=int, default=16, help="LoRA rank (default: 16)")
+    parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha (default: 32)")
+    parser.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout (default: 0.05)")
+    parser.add_argument("--lora_target_modules", type=str, nargs="+", default=["q_proj", "v_proj"],
+                        help="LLM modules to apply LoRA to (default: q_proj v_proj)")
     return parser.parse_args()
 
 
@@ -88,6 +95,11 @@ def main():
         hidden_state_weight=args.hidden_state_weight,
         hidden_state_layers=args.hidden_state_layers,
         compression_schedule=args.compression_schedule,
+        lora=args.lora,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        lora_target_modules=args.lora_target_modules,
     )
 
     qformer_config = QFormerConfig(
@@ -108,8 +120,8 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Load frozen LLM
-    logger.info(f"Loading frozen LLM: {model_config.model_name}")
+    # Load LLM
+    logger.info(f"Loading LLM: {model_config.model_name}")
     model = AutoModelForCausalLM.from_pretrained(
         model_config.model_name,
         torch_dtype=torch.float16,
@@ -119,13 +131,29 @@ def main():
     for param in model.parameters():
         param.requires_grad = False
 
+    # Apply LoRA adapters if requested
+    base_model = model  # keep reference to unwrapped LlamaForCausalLM
+    if training_config.lora:
+        from peft import LoraConfig, get_peft_model
+        lora_config = LoraConfig(
+            r=training_config.lora_rank,
+            lora_alpha=training_config.lora_alpha,
+            lora_dropout=training_config.lora_dropout,
+            target_modules=training_config.lora_target_modules,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, lora_config)
+        lora_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        logger.info(f"LoRA enabled: {lora_params / 1e6:.1f}M trainable LLM params")
+
     if training_config.gradient_checkpoint_llm:
         model.gradient_checkpointing_enable()
-        logger.info("Enabled gradient checkpointing for frozen LLM (Stage B)")
+        logger.info("Enabled gradient checkpointing for LLM (Stage B)")
 
-    # Build Q-Former (pass LLM so frozen KV projections are copied)
+    # Build Q-Former (pass unwrapped LLM so frozen KV projections are copied correctly)
     logger.info("Building Q-Former KV compressor")
-    qformer = QFormerKVCompressor(qformer_config, model_config, llm=model).to(device)
+    qformer = QFormerKVCompressor(qformer_config, model_config, llm=base_model).to(device)
     if qformer_config.cross_attn_mode == "chunked":
         qformer._cross_attend_chunked = torch.compile(qformer._cross_attend_chunked, dynamic=True)
     else:
@@ -191,6 +219,10 @@ def main():
         trainer.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         if "scaler_state_dict" in ckpt:
             trainer.scaler.load_state_dict(ckpt["scaler_state_dict"])
+        if training_config.lora and "lora_state_dict" in ckpt:
+            from peft import set_peft_model_state_dict
+            set_peft_model_state_dict(model, ckpt["lora_state_dict"])
+            logger.info("Restored LoRA adapter weights from checkpoint")
         logger.info(f"Resumed from step {ckpt.get('step', '?')}")
 
     # Train

@@ -7,4 +7,5 @@ sentencepiece>=0.2.0
 protobuf>=4.25.0
 tqdm>=4.66.0
 wandb>=0.16.0
+peft>=0.10.0
 numpy

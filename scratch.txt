@@ -2,6 +2,8 @@ python train.py --dataset hotpotqa --compression_schedule 16 --hidden_state_loss
 python train.py --compression_schedule 16 --layer_adapter_rank 8
 python train.py --num_epochs 1 --layer_adapter_rank 8
 
+sbatch slurms/h100.slurm test --num_epochs 1 --layer_adapter_rank 8 --lora
+
 32x
 no hidden_state_loss
 

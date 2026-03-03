@@ -46,9 +46,12 @@ class TwoStageTrainer:
         self.training_config = training_config
         self.device = device
 
-        # Optimizer (only Q-Former parameters)
+        # Optimizer (Q-Former + LoRA parameters if enabled)
+        trainable_params = list(qformer.parameters())
+        if training_config.lora:
+            trainable_params += [p for p in model.parameters() if p.requires_grad]
         self.optimizer = torch.optim.AdamW(
-            qformer.parameters(),
+            trainable_params,
             lr=training_config.learning_rate,
             betas=(training_config.adam_beta1, training_config.adam_beta2),
             weight_decay=training_config.weight_decay,
@@ -87,7 +90,10 @@ class TwoStageTrainer:
 
     def train(self):
         """Main training loop."""
-        self.model.eval()
+        if self.training_config.lora:
+            self.model.train()
+        else:
+            self.model.eval()
         self.qformer.train()
 
         global_step = 0
@@ -142,8 +148,11 @@ class TwoStageTrainer:
                 if accumulation_count % self.training_config.gradient_accumulation_steps == 0:
                     # Gradient clipping
                     self.scaler.unscale_(self.optimizer)
+                    clip_params = list(self.qformer.parameters())
+                    if self.training_config.lora:
+                        clip_params += [p for p in self.model.parameters() if p.requires_grad]
                     torch.nn.utils.clip_grad_norm_(
-                        self.qformer.parameters(),
+                        clip_params,
                         self.training_config.max_grad_norm,
                     )
 
@@ -233,6 +242,8 @@ class TwoStageTrainer:
                                 log_dict["eval/kl_loss"] = eval_secondary
                             wandb.log(log_dict)
                         self.qformer.train()
+                        if self.training_config.lora:
+                            self.model.train()
 
                     # Save checkpoint
                     if global_step % self.training_config.save_steps == 0:
@@ -264,10 +275,14 @@ class TwoStageTrainer:
 
         # === Stage A: Run frozen LLM on [preamble+docs | Q+A], extract hidden states + teacher logits ===
         with torch.no_grad():
+            if self.training_config.lora:
+                self.model.disable_adapter_layers()
             doc_hidden_states, teacher_logits, teacher_qa_hidden = self._stage_a(
                 doc_token_ids, doc_lengths, stage_b_input_ids,
                 preamble_ids, block_lengths,
             )
+            if self.training_config.lora:
+                self.model.enable_adapter_layers()
 
         if self.training_config.offload_stage_a_to_cpu:
             doc_hidden_states = [
@@ -287,6 +302,12 @@ class TwoStageTrainer:
             )
 
         return loss
+
+    def _get_rotary_emb(self):
+        """Get rotary embedding, handling PEFT model wrapping."""
+        if self.training_config.lora:
+            return self.model.get_base_model().model.rotary_emb
+        return self.model.model.rotary_emb
 
     def _get_hidden_state_layer_indices(self) -> list[int]:
         """Return which layer indices to use for hidden state matching.
@@ -407,7 +428,7 @@ class TwoStageTrainer:
         # Apply RoPE to compressed K values at prefix positions [0, prefix_len)
         # Q-Former outputs raw K without RoPE; the LLM expects cached K to be
         # pre-rotated (as it would be during normal autoregressive generation).
-        rotary_emb = self.model.model.rotary_emb
+        rotary_emb = self._get_rotary_emb()
         compressed_cache = apply_rope_to_cache(
             compressed_cache, self.model_config.num_layers, rotary_emb
         )
@@ -565,6 +586,8 @@ class TwoStageTrainer:
     def evaluate(self, compression_ratio: int) -> tuple[float, float]:
         """Evaluate on the eval set. Returns (avg CE loss, avg KL loss)."""
         self.qformer.eval()
+        if self.training_config.lora:
+            self.model.eval()
         total_ce = 0.0
         total_kl = 0.0
         num_batches = 0
@@ -584,11 +607,15 @@ class TwoStageTrainer:
             preamble_len = preamble_ids.shape[0]
             block_lengths = [preamble_len + doc_lengths[0]] + doc_lengths[1:]
 
-            # Stage A
+            # Stage A (disable LoRA for teacher forward)
+            if self.training_config.lora:
+                self.model.disable_adapter_layers()
             doc_hidden_states, teacher_logits, teacher_qa_hidden = self._stage_a(
                 doc_token_ids, doc_lengths, stage_b_input_ids,
                 preamble_ids, block_lengths,
             )
+            if self.training_config.lora:
+                self.model.enable_adapter_layers()
             if self.training_config.offload_stage_a_to_cpu:
                 doc_hidden_states = [
                     [hs.to(self.device) for hs in doc_hs]
@@ -609,7 +636,7 @@ class TwoStageTrainer:
                 )
 
                 # Apply RoPE to compressed K values at prefix positions
-                rotary_emb = self.model.model.rotary_emb
+                rotary_emb = self._get_rotary_emb()
                 compressed_cache = apply_rope_to_cache(
                     compressed_cache, self.model_config.num_layers, rotary_emb
                 )
@@ -664,20 +691,24 @@ class TwoStageTrainer:
         )
 
     def _save_checkpoint(self, step: int, compression_ratio: int):
-        """Save Q-Former checkpoint."""
+        """Save Q-Former (and LoRA adapter) checkpoint."""
         save_dir = os.path.join(self.training_config.output_dir, f"checkpoint-{step}")
         os.makedirs(save_dir, exist_ok=True)
 
-        torch.save(
-            {
-                "step": step,
-                "compression_ratio": compression_ratio,
-                "qformer_state_dict": self.qformer.state_dict(),
-                "optimizer_state_dict": self.optimizer.state_dict(),
-                "scaler_state_dict": self.scaler.state_dict(),
-            },
-            os.path.join(save_dir, "checkpoint.pt"),
-        )
+        ckpt = {
+            "step": step,
+            "compression_ratio": compression_ratio,
+            "qformer_state_dict": self.qformer.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scaler_state_dict": self.scaler.state_dict(),
+        }
+
+        if self.training_config.lora:
+            # Save only the LoRA adapter weights (not the full LLM)
+            from peft import get_peft_model_state_dict
+            ckpt["lora_state_dict"] = get_peft_model_state_dict(self.model)
+
+        torch.save(ckpt, os.path.join(save_dir, "checkpoint.pt"))
         logger.info(f"Checkpoint saved at {save_dir}")
 
     def verify_gradient_flow(self):
