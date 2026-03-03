@@ -6,8 +6,8 @@ sbatch slurms/h100.slurm test --num_epochs 1 --layer_adapter_rank 8 --lora --com
 lora -> no lora
 
 32x
-no hidden_state_loss
-
+Self attention on K/V states in groups
+Reconstruction loss
 
 Compression scheduling?
 Learning rate
