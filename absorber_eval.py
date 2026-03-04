@@ -200,17 +200,17 @@ def absorber_forward_single_doc(
     # 8. Get RoPE cos/sin for un-application at positions [0, K)
     summary_pos_ids = torch.arange(K, device=device).unsqueeze(0)
     rotary_emb = model.model.rotary_emb
-    dummy = cache.key_cache[0][:, :, :K, :]  # [1, heads, K, head_dim]
+    dummy = cache.layers[0].keys[:, :, :K, :]  # [1, heads, K, head_dim]
     cos, sin = rotary_emb(dummy, position_ids=summary_pos_ids)
     cos = cos.unsqueeze(1)  # [1, 1, K, head_dim]
     sin = sin.unsqueeze(1)
 
     # 9. Extract and un-apply RoPE
     raw_kv_pairs = []
-    num_layers = len(cache.key_cache)
+    num_layers = len(cache.layers)
     for layer_idx in range(num_layers):
-        k_full = cache.key_cache[layer_idx]
-        v_full = cache.value_cache[layer_idx]
+        k_full = cache.layers[layer_idx].keys
+        v_full = cache.layers[layer_idx].values
         # Extract summary positions only
         k_summary = k_full[:, :, :K, :]  # [1, heads, K, head_dim]
         v_summary = v_full[:, :, :K, :]
