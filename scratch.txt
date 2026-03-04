@@ -8,8 +8,11 @@ lora -> no lora
 32x
 Self attention on K/V states in groups instead
 Positional information in CA
-Sequential queries!
+Sequential queries across layers!
 Queries initted from 0-1 positional?
+Queries self attention
+Self attention on final K/V
+Simple K/V self attention halving dimension each time (mean or selective pooling)
 
 Reconstruction loss
 Compression scheduling?
