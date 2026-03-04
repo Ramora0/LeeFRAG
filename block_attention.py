@@ -100,6 +100,61 @@ def build_block_causal_mask_with_qa(
     return mask.unsqueeze(0).unsqueeze(0)
 
 
+def build_block_prefix_causal_mask(
+    prefix_lengths: list[int],
+    input_block_lengths: list[int],
+    dtype: torch.dtype = torch.float16,
+    device: torch.device | str = "cpu",
+) -> torch.Tensor:
+    """Build attention mask for reconstruction Stage B with block-diagonal prefix.
+
+    The prefix (compressed KV caches) is block-diagonal — each input block
+    attends to ONLY its own compressed prefix segment. The input tokens have
+    standard causal attention across ALL blocks.
+
+              comp_d0  comp_d1  comp_d2 | block0  block1  block2
+      block0 [  full    -inf     -inf  |                         ]
+      block1 [  -inf    full     -inf  |   full causal across all]
+      block2 [  -inf    -inf     full  |                         ]
+
+    Args:
+        prefix_lengths: Per-document compressed KV lengths (may vary).
+        input_block_lengths: Per-document input block lengths.
+        dtype: Mask dtype.
+        device: Target device.
+
+    Returns:
+        mask: [1, 1, sum(input_block_lengths), sum(prefix_lengths) + sum(input_block_lengths)]
+    """
+    total_prefix = sum(prefix_lengths)
+    total_input = sum(input_block_lengths)
+    total_cols = total_prefix + total_input
+
+    mask = torch.full(
+        (total_input, total_cols),
+        float("-inf"),
+        dtype=dtype,
+        device=device,
+    )
+
+    # Prefix columns: block-diagonal (each block attends only to its own prefix)
+    input_offset = 0
+    prefix_offset = 0
+    for p_len, i_len in zip(prefix_lengths, input_block_lengths):
+        mask[input_offset : input_offset + i_len, prefix_offset : prefix_offset + p_len] = 0.0
+        input_offset += i_len
+        prefix_offset += p_len
+
+    # Input columns: standard causal mask across the entire input sequence
+    causal = torch.triu(
+        torch.full((total_input, total_input), float("-inf"), dtype=dtype, device=device),
+        diagonal=1,
+    )
+    mask[:, total_prefix:] = causal
+
+    return mask.unsqueeze(0).unsqueeze(0)
+
+
 def build_prefix_causal_mask(
     prefix_length: int,
     seq_length: int,

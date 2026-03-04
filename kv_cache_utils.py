@@ -101,6 +101,82 @@ def apply_rope_to_cache(
     return cache
 
 
+def apply_rope_to_cache_blocked(
+    cache: DynamicCache,
+    num_layers: int,
+    rotary_emb: nn.Module,
+    prefix_lengths: list[int],
+) -> DynamicCache:
+    """Apply RoPE to K values with per-block position IDs.
+
+    Each doc's prefix segment gets positions [0, prefix_len_i) rather than
+    continuous positions across all docs. This matches the block-diagonal
+    prefix mask where each doc's compressed cache is independent context.
+
+    Args:
+        cache: DynamicCache with compressed K/V from Q-Former.
+        num_layers: Number of LLM layers.
+        rotary_emb: The LLM's LlamaRotaryEmbedding module.
+        prefix_lengths: Per-document compressed KV lengths.
+
+    Returns:
+        The same cache with RoPE applied to all K values in-place.
+    """
+    total_prefix = sum(prefix_lengths)
+    device = cache.layers[0].keys.device
+
+    # Build per-block position IDs: each block starts at 0
+    position_ids = torch.zeros(total_prefix, dtype=torch.long, device=device)
+    offset = 0
+    for p_len in prefix_lengths:
+        position_ids[offset : offset + p_len] = torch.arange(p_len, device=device)
+        offset += p_len
+    position_ids = position_ids.unsqueeze(0)  # [1, total_prefix]
+
+    # Get cos/sin from the model's rotary embedding
+    cos, sin = rotary_emb(cache.layers[0].keys, position_ids=position_ids)
+    cos = cos.unsqueeze(1)  # [1, 1, total_prefix, head_dim]
+    sin = sin.unsqueeze(1)
+
+    for layer_idx in range(num_layers):
+        k = cache.layers[layer_idx].keys
+        cache.layers[layer_idx].keys = (k * cos) + (_rotate_half(k) * sin)
+
+    return cache
+
+
+def build_blocked_position_ids(
+    prefix_lengths: list[int],
+    input_block_lengths: list[int],
+    device: torch.device | str = "cpu",
+) -> torch.Tensor:
+    """Build position IDs for input tokens with per-block offsets.
+
+    Each block's positions start at its prefix_length_i (continuing from the
+    compressed prefix). Positions are NOT continuous across blocks — each block
+    restarts from its own prefix length.
+
+    Args:
+        prefix_lengths: Per-document compressed KV lengths.
+        input_block_lengths: Per-document input block lengths.
+        device: Target device.
+
+    Returns:
+        position_ids: [1, total_input_len] tensor.
+    """
+    total_input = sum(input_block_lengths)
+    position_ids = torch.zeros(total_input, dtype=torch.long, device=device)
+
+    offset = 0
+    for p_len, i_len in zip(prefix_lengths, input_block_lengths):
+        position_ids[offset : offset + i_len] = torch.arange(
+            p_len, p_len + i_len, device=device,
+        )
+        offset += i_len
+
+    return position_ids.unsqueeze(0)  # [1, total_input_len]
+
+
 def concat_compressed_caches(
     per_doc_compressed: list[list[tuple[torch.Tensor, torch.Tensor]]],
     num_layers: int,
