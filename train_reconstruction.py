@@ -60,6 +60,8 @@ def parse_args():
                         help="Scale factor for Q-Former attn_dim and ffn_dim (default: 1)")
     parser.add_argument("--layer_adapter_rank", type=int, default=0,
                         help="Per-layer low-rank adapter rank (0=disabled)")
+    parser.add_argument("--bypass", action="store_true",
+                        help="Skip Q-Former and use identity (frozen KV proj only) to measure CE floor")
     return parser.parse_args()
 
 
@@ -177,6 +179,10 @@ def main():
         training_config=training_config,
         device=device,
     )
+
+    if args.bypass:
+        trainer.bypass = True
+        logger.info("Bypass mode: Q-Former skipped, using identity (frozen KV proj only)")
 
     # Resume from checkpoint
     if args.resume_from:

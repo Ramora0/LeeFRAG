@@ -52,6 +52,7 @@ class ReconstructionTrainer:
         self.model_config = model_config
         self.training_config = training_config
         self.device = device
+        self.bypass = False
 
         # Optimizer (Q-Former parameters only — no LoRA for reconstruction)
         self.optimizer = torch.optim.AdamW(
@@ -347,7 +348,7 @@ class ReconstructionTrainer:
         per_doc_compressed = []
         empirical_ratios = []
         for doc_hs in doc_hidden_states:
-            compressed = self.qformer(doc_hs, compression_ratio)
+            compressed = self.qformer(doc_hs, compression_ratio, bypass=self.bypass)
             per_doc_compressed.append(compressed)
             doc_len = doc_hs[0].shape[1]
             num_queries = compressed[0][0].shape[2]
@@ -562,7 +563,7 @@ class ReconstructionTrainer:
             with torch.amp.autocast("cuda", enabled=self.training_config.fp16):
                 per_doc_compressed = []
                 for doc_hs in doc_hidden_states:
-                    compressed = self.qformer(doc_hs, compression_ratio)
+                    compressed = self.qformer(doc_hs, compression_ratio, bypass=self.bypass)
                     per_doc_compressed.append(compressed)
 
                 prefix_lengths = [
