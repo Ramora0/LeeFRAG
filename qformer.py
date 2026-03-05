@@ -40,15 +40,27 @@ class QFormerKVCompressor(nn.Module):
         head_dim = model_config.head_dim
         kv_dim = num_kv_heads * head_dim  # 1024
 
-        # Per-layer embeddings for conditioning (in attn_dim since they only affect routing)
-        self.layer_embeddings = nn.Parameter(
+        # Per-layer embeddings for conditioning Q and K in cross-attention
+        self.layer_embeddings_q = nn.Parameter(
+            torch.randn(model_config.num_layers, 1, attn_dim) * 0.02
+        )
+        self.layer_embeddings_k = nn.Parameter(
             torch.randn(model_config.num_layers, 1, attn_dim) * 0.02
         )
 
-        # Multi-head cross-attention with bottleneck V
+        # Multi-head attention dimensions
         self.num_attn_heads = config.num_attn_heads
         self.attn_head_dim = attn_dim // config.num_attn_heads
 
+        # Self-attention among queries (before cross-attention)
+        self.self_attn_norm = nn.RMSNorm(hidden)
+        self.self_q = nn.Linear(hidden, attn_dim, bias=False)
+        self.self_k = nn.Linear(hidden, attn_dim, bias=False)
+        self.self_v = nn.Linear(hidden, attn_dim, bias=False)
+        self.self_out = nn.Linear(attn_dim, hidden, bias=False)
+        nn.init.zeros_(self.self_out.weight)  # no-op at init
+
+        # Cross-attention with bottleneck V
         self.cross_q = nn.Linear(hidden, attn_dim, bias=False)
         self.cross_k = nn.Linear(hidden, attn_dim, bias=False)
         self.cross_v = nn.Linear(hidden, attn_dim, bias=False)
@@ -114,18 +126,61 @@ class QFormerKVCompressor(nn.Module):
 
         self.gradient_checkpointing = config.gradient_checkpointing
 
+    @staticmethod
+    def _sinusoidal_pe(seq_len: int, dim: int, device, dtype) -> torch.Tensor:
+        """Generate sinusoidal positional encoding. [seq_len, dim]"""
+        pos = torch.arange(seq_len, device=device, dtype=dtype).unsqueeze(1)
+        dim_idx = torch.arange(0, dim, 2, device=device, dtype=dtype)
+        freq = 1.0 / (10000.0 ** (dim_idx / dim))
+        pe = torch.zeros(seq_len, dim, device=device, dtype=dtype)
+        pe[:, 0::2] = torch.sin(pos * freq)
+        pe[:, 1::2] = torch.cos(pos * freq)
+        return pe
+
+    def _self_attend(self, queries: torch.Tensor) -> torch.Tensor:
+        """Multi-head self-attention among queries with sinusoidal PE.
+
+        Args:
+            queries: [num_layers, num_queries, 4096]
+
+        Returns:
+            output: [num_layers, num_queries, 4096]
+        """
+        B, num_q, _ = queries.shape
+        H = self.num_attn_heads
+        D = self.attn_head_dim
+
+        q_normed = self.self_attn_norm(queries)
+        pe = self._sinusoidal_pe(num_q, q_normed.shape[-1], q_normed.device, q_normed.dtype)
+        q_normed = q_normed + pe
+
+        q = self.self_q(q_normed).view(B, num_q, H, D).transpose(1, 2)
+        k = self.self_k(q_normed).view(B, num_q, H, D).transpose(1, 2)
+        v = self.self_v(q_normed).view(B, num_q, H, D).transpose(1, 2)
+
+        # Causal-free self-attention (all queries attend to all queries)
+        scale = D ** -0.5
+        attn_logits = torch.matmul(q, k.transpose(-2, -1)) * scale
+        attn_weights = F.softmax(attn_logits, dim=-1)
+        attn_out = torch.matmul(attn_weights, v)
+
+        attn_out = attn_out.transpose(1, 2).reshape(B, num_q, -1)
+        return queries + self.self_out(attn_out)
+
     def _cross_attend(
         self,
         queries: torch.Tensor,
         hidden_states: torch.Tensor,
-        layer_emb: torch.Tensor,
+        layer_emb_q: torch.Tensor,
+        layer_emb_k: torch.Tensor,
     ) -> torch.Tensor:
         """Multi-head cross-attention with bottleneck V and ALiBi position bias.
 
         Args:
             queries: [num_layers, num_queries, 4096]
             hidden_states: [num_layers, doc_len, 4096]
-            layer_emb: [num_layers, 1, attn_dim]
+            layer_emb_q: [num_layers, 1, attn_dim]
+            layer_emb_k: [num_layers, 1, attn_dim]
 
         Returns:
             output: [num_layers, num_queries, 4096]
@@ -140,9 +195,9 @@ class QFormerKVCompressor(nn.Module):
         q_normed = self.attn_norm(queries)
         hs_normed = self.attn_norm(hidden_states)
 
-        # Project Q/K/V to attn_dim, add layer conditioning to Q
-        q = self.cross_q(q_normed) + layer_emb   # [B, Q, attn_dim]
-        k = self.cross_k(hs_normed)               # [B, kv_len, attn_dim]
+        # Project Q/K/V to attn_dim, add layer conditioning to Q and K
+        q = self.cross_q(q_normed) + layer_emb_q  # [B, Q, attn_dim]
+        k = self.cross_k(hs_normed) + layer_emb_k # [B, kv_len, attn_dim]
         v = self.cross_v(hs_normed)                # [B, kv_len, attn_dim]
 
         # Reshape to multi-head: [B, H, seq, head_dim]
@@ -177,14 +232,16 @@ class QFormerKVCompressor(nn.Module):
         self,
         queries: torch.Tensor,
         chunked_hs: torch.Tensor,
-        layer_emb: torch.Tensor,
+        layer_emb_q: torch.Tensor,
+        layer_emb_k: torch.Tensor,
     ) -> torch.Tensor:
         """Chunked multi-head cross-attention: one learned query attends to each chunk.
 
         Args:
             queries: [num_layers, num_chunks, 4096] (expanded learned query)
             chunked_hs: [num_layers, num_chunks, chunk_size, 4096]
-            layer_emb: [num_layers, 1, attn_dim]
+            layer_emb_q: [num_layers, 1, attn_dim]
+            layer_emb_k: [num_layers, 1, attn_dim]
 
         Returns:
             compressed: [num_layers, num_chunks, 4096]
@@ -197,16 +254,17 @@ class QFormerKVCompressor(nn.Module):
         N = num_layers * num_chunks
         q_flat = queries.reshape(N, 1, -1)       # [N, 1, 4096]
         hs_flat = chunked_hs.reshape(N, chunk_size, -1)  # [N, cs, 4096]
-        le_flat = layer_emb.expand(-1, num_chunks, -1).reshape(N, 1, -1)
+        le_q_flat = layer_emb_q.expand(-1, num_chunks, -1).reshape(N, 1, -1)
+        le_k_flat = layer_emb_k.expand(-1, num_chunks, -1).reshape(N, 1, -1)
 
         # Pre-norm before cross-attention
         q_normed = self.attn_norm(q_flat)
         hs_normed = self.attn_norm(hs_flat)
 
         # Project Q/K/V
-        q = self.cross_q(q_normed) + le_flat  # [N, 1, attn_dim]
-        k = self.cross_k(hs_normed)           # [N, cs, attn_dim]
-        v = self.cross_v(hs_normed)           # [N, cs, attn_dim]
+        q = self.cross_q(q_normed) + le_q_flat  # [N, 1, attn_dim]
+        k = self.cross_k(hs_normed) + le_k_flat # [N, cs, attn_dim]
+        v = self.cross_v(hs_normed)              # [N, cs, attn_dim]
 
         # Multi-head reshape: [N, H, seq, head_dim]
         q = q.view(N, 1, H, D).transpose(1, 2)
@@ -288,10 +346,12 @@ class QFormerKVCompressor(nn.Module):
         self,
         queries: torch.Tensor,
         all_hs: torch.Tensor,
-        layer_emb: torch.Tensor,
+        layer_emb_q: torch.Tensor,
+        layer_emb_k: torch.Tensor,
     ) -> torch.Tensor:
         """Inner forward for gradient checkpointing."""
-        x = self._cross_attend(queries, all_hs, layer_emb)
+        x = self._self_attend(queries)
+        x = self._cross_attend(x, all_hs, layer_emb_q, layer_emb_k)
         x = self._ffn(x, x)
         return x
 
@@ -299,10 +359,12 @@ class QFormerKVCompressor(nn.Module):
         self,
         queries: torch.Tensor,
         chunked_hs: torch.Tensor,
-        layer_emb: torch.Tensor,
+        layer_emb_q: torch.Tensor,
+        layer_emb_k: torch.Tensor,
     ) -> torch.Tensor:
         """Inner forward (chunked mode) for gradient checkpointing."""
-        x = self._cross_attend_chunked(queries, chunked_hs, layer_emb)
+        x = self._self_attend(queries)
+        x = self._cross_attend_chunked(x, chunked_hs, layer_emb_q, layer_emb_k)
         x = self._ffn(x, x)
         return x
 
@@ -353,11 +415,16 @@ class QFormerKVCompressor(nn.Module):
 
             if self.gradient_checkpointing and self.training:
                 compressed = checkpoint(
-                    self._forward_inner_chunked, queries, chunked_hs, self.layer_embeddings,
+                    self._forward_inner_chunked, queries, chunked_hs,
+                    self.layer_embeddings_q, self.layer_embeddings_k,
                     use_reentrant=False,
                 )
             else:
-                compressed = self._cross_attend_chunked(queries, chunked_hs, self.layer_embeddings)
+                compressed = self._self_attend(queries)
+                compressed = self._cross_attend_chunked(
+                    compressed, chunked_hs,
+                    self.layer_embeddings_q, self.layer_embeddings_k,
+                )
                 compressed = self._ffn(compressed, compressed)
         else:
             # Global mode: mean-pooled queries attend to entire sequence
@@ -373,11 +440,16 @@ class QFormerKVCompressor(nn.Module):
             # V-free cross-attention: learned routing, raw hidden state values
             if self.gradient_checkpointing and self.training:
                 compressed = checkpoint(
-                    self._forward_inner, pooled, all_hs, self.layer_embeddings,
+                    self._forward_inner, pooled, all_hs,
+                    self.layer_embeddings_q, self.layer_embeddings_k,
                     use_reentrant=False,
                 )
             else:
-                compressed = self._cross_attend(pooled, all_hs, self.layer_embeddings)
+                compressed = self._self_attend(pooled)
+                compressed = self._cross_attend(
+                    compressed, all_hs,
+                    self.layer_embeddings_q, self.layer_embeddings_k,
+                )
                 compressed = self._ffn(compressed, compressed)
 
         # Per-layer low-rank adapter

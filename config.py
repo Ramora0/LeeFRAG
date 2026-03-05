@@ -18,9 +18,9 @@ class ModelConfig:
 
 @dataclass
 class QFormerConfig:
-    attn_dim: int = 256  # projection dim for cross-attention Q/K/V
+    attn_dim: int = 512  # projection dim for cross-attention Q/K/V
     num_attn_heads: int = 8  # number of attention heads (attn_dim must be divisible)
-    ffn_dim: int = 256  # SwiGLU intermediate dim
+    ffn_dim: int = 512  # SwiGLU intermediate dim
     max_query_tokens: int = 512
     cross_attn_mode: str = "global"  # "global" (mean-pooled queries attend all) or "chunked" (one query per chunk)
     layer_adapter_rank: int = 0  # if > 0, add per-layer low-rank residual adapter before frozen KV proj

@@ -6,9 +6,15 @@ sbatch slurms/h100.slurm test --num_epochs 1 --layer_adapter_rank 8 --lora --com
 lora -> no lora
 
 32x
-no hidden_state_loss
+Queries self attention
+Self attention on K/V states in groups instead
+Positional information in CA
+Sequential queries across layers!
+Queries initted from 0-1 positional?
+Self attention on final K/V
+Simple K/V self attention halving dimension each time (mean or selective pooling)
 
-
+Reconstruction loss
 Compression scheduling?
 Learning rate
 Schedule hidden state down
