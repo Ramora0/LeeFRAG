@@ -5,6 +5,7 @@ import re
 import torch
 from datasets import load_dataset
 from torch.utils.data import Dataset
+from tqdm import tqdm
 from transformers import PreTrainedTokenizer
 
 from leefrag.config import ModelConfig
@@ -286,14 +287,16 @@ class GeneralTextDataset(Dataset):
 
         # Tokenize all documents upfront and chunk into fixed-size windows
         window = model_config.max_total_doc_tokens + max_continuation_tokens
+        logger.info(f"Batch-tokenizing {len(raw_data)} documents...")
         all_texts = [raw_data[i]["text"] for i in range(len(raw_data))]
         all_token_ids = tokenizer(
             all_texts, add_special_tokens=False,
         )["input_ids"]
         del all_texts
+        logger.info("Tokenization complete, chunking...")
 
         self.chunks = []  # list of token id lists, one per chunk
-        for token_ids in all_token_ids:
+        for token_ids in tqdm(all_token_ids, desc="Chunking docs"):
             if len(token_ids) < 256:
                 continue
             for start in range(0, len(token_ids) - 256, window):
