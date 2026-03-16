@@ -327,7 +327,6 @@ class QFormerKVCompressor(nn.Module):
         """
         doc_len = doc_hidden_states[0].shape[1]
         num_queries = max(1, doc_len // compression_ratio)
-        num_queries = min(num_queries, self.max_query_tokens)
 
         # Stack all layers' hidden states: [num_layers, doc_len, 4096]
         all_hs = torch.cat(doc_hidden_states, dim=0)
@@ -340,7 +339,6 @@ class QFormerKVCompressor(nn.Module):
             # Chunked mode: one learned query attends to each chunk_size segment
             chunk_size = compression_ratio
             num_chunks = doc_len // chunk_size
-            num_chunks = min(num_chunks, self.max_query_tokens)
             usable_len = num_chunks * chunk_size
 
             # Reshape into chunks: [num_layers, num_chunks, chunk_size, 4096]
