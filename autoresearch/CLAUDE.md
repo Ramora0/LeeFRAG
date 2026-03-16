@@ -85,7 +85,7 @@ grep "^eval_ce_loss:\|^peak_vram_mb:\|^total_steps:" run.log
 
 - `--model_name MODEL` — HuggingFace model (default: `meta-llama/Llama-3.2-1B`)
 - `--time_budget SECONDS` — wall-clock training budget (default: 300)
-- `--compression_schedule 2 4 8 16` — ratio progression (each phase gets equal time)
+- `--compression_schedule 2 4 8 16` — ratio progression (each phase gets equal time, default: 16)
 - `--cross_attn_mode global|chunked` — Q-Former cross-attention strategy
 - `--scale N` — multiply Q-Former attn_dim/ffn_dim by N
 - `--ce_only` — disable KL loss

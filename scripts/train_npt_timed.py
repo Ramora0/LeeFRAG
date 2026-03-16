@@ -86,7 +86,7 @@ def parse_args():
     parser.add_argument("--kl_top_k", type=int, default=0)
 
     # Compression
-    parser.add_argument("--compression_schedule", type=int, nargs="+", default=[4])
+    parser.add_argument("--compression_schedule", type=int, nargs="+", default=[16])
 
     # Q-Former
     parser.add_argument("--cross_attn_mode", type=str, default="global",
