@@ -186,15 +186,7 @@ def main():
 
     # Build Q-Former
     logger.info("Building Q-Former KV compressor")
-    qformer = QFormerKVCompressor(qformer_config, model_config, llm=model).to(device)
-    if qformer_config.cross_attn_mode == "chunked":
-        qformer._cross_attend_chunked = torch.compile(
-            qformer._cross_attend_chunked, dynamic=True,
-        )
-    else:
-        qformer._cross_attend = torch.compile(
-            qformer._cross_attend, dynamic=True,
-        )
+    qformer = QFormerKVCompressor(qformer_config, model_config, llm=model).to(device=device, dtype=torch.float16)
     trainable_params = sum(p.numel() for p in qformer.parameters() if p.requires_grad)
     logger.info(f"Q-Former trainable params: {trainable_params / 1e6:.1f}M")
 
@@ -266,7 +258,7 @@ def main():
     logger.info(f"Starting timed NPT training ({args.time_budget}s budget)...")
 
     train_start = time.monotonic()
-    global_step = trainer.train_timed(args.time_budget)
+    global_step = trainer.train_timed(args.time_budget, verbose=args.verbose)
     training_seconds = time.monotonic() - train_start
 
     # === Eval (not counted in time budget) ===

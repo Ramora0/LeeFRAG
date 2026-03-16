@@ -224,7 +224,7 @@ class NPTTrainer:
         self._save_checkpoint(global_step, compression_ratio)
         logger.info("Training complete.")
 
-    def train_timed(self, time_budget: float) -> int:
+    def train_timed(self, time_budget: float, verbose: bool = False) -> int:
         """Time-budgeted training loop.
 
         Trains until wall-clock budget is exhausted. LR and compression
@@ -232,6 +232,7 @@ class NPTTrainer:
 
         Args:
             time_budget: Training time in seconds.
+            verbose: If True, show tqdm progress bar with samples/sec.
 
         Returns:
             Number of optimizer steps completed.
@@ -241,6 +242,7 @@ class NPTTrainer:
 
         global_step = 0
         accumulation_count = 0
+        sample_count = 0
         accum_loss = 0.0
         accum_ce = 0.0
         accum_kl = 0.0
@@ -251,6 +253,14 @@ class NPTTrainer:
         deadline = start_time + time_budget
         epoch = 0
         prev_phase = -1
+
+        pbar = tqdm(
+            total=int(time_budget),
+            desc="Training",
+            unit="s",
+            disable=not verbose,
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt}s [{elapsed}<{remaining}, {postfix}]",
+        )
 
         while time.monotonic() < deadline:
             epoch += 1
@@ -274,6 +284,7 @@ class NPTTrainer:
                 if loss is None:
                     continue
 
+                sample_count += 1
                 loss = loss / self.training_config.gradient_accumulation_steps
                 self.scaler.scale(loss).backward()
 
@@ -301,6 +312,17 @@ class NPTTrainer:
                         avg_loss = accum_loss / accum_micro_batches
                         avg_ce = accum_ce / accum_micro_batches
                         avg_kl = accum_kl / accum_micro_batches
+
+                        # Update tqdm
+                        new_elapsed = time.monotonic() - start_time
+                        pbar.n = min(int(new_elapsed), int(time_budget))
+                        samples_per_sec = sample_count / new_elapsed if new_elapsed > 0 else 0
+                        pbar.set_postfix_str(
+                            f"{samples_per_sec:.1f} samp/s, "
+                            f"ce={avg_ce:.4f}, step={global_step}, "
+                            f"comp={compression_ratio}x, ep={epoch}"
+                        )
+                        pbar.refresh()
 
                         if global_step % self.training_config.logging_steps == 0:
                             lr = self.optimizer.param_groups[0]["lr"]
@@ -330,6 +352,8 @@ class NPTTrainer:
                         accum_kl = 0.0
                         accum_empirical_ratio = 0.0
                         accum_micro_batches = 0
+
+        pbar.close()
 
         # Final checkpoint
         compression_ratio = self.compression_scheduler.ratios[-1]
