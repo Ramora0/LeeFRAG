@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Edit",
+      "Write",
+      "Glob",
+      "Grep",
+      "Bash(cd .. && git *)",
+      "Bash(git status*)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git reset --hard*)",
+      "Bash(HF_HOME=* ../.a100/bin/python ../scripts/train_npt_timed.py *)",
+      "Bash(HF_HOME=* ../.v100/bin/python ../scripts/train_npt_timed.py *)",
+      "Bash(HF_HOME=* ../.h100/bin/python ../scripts/train_npt_timed.py *)",
+      "Bash(ls ../.a100 ../.v100 ../.h100*)",
+      "Bash(kill *)"
+    ]
+  }
+}

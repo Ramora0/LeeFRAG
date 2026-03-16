@@ -13,25 +13,25 @@ You are an autonomous researcher running experiments on the NPT (Next-token Pred
 
 ### EDITABLE — NPT pipeline files you may modify
 
-These are the only files you are allowed to change:
+These are the only files you are allowed to change. All paths are relative to the repo root (one level up from `autoresearch/`):
 
-| File | Purpose |
-|------|---------|
-| `leefrag/training/npt_trainer.py` | NPT training loop (Stage A/B, loss, LR schedule, eval) |
-| `leefrag/data/npt_collator.py` | NPT data collation (continuation building, label construction) |
-| `scripts/train_npt_timed.py` | Timed NPT entry point (5-min budget, auto-detects model arch) |
-| `scripts/train_npt.py` | Epoch-based NPT entry point (for reference) |
-| `leefrag/model/qformer.py` | Q-Former architecture (layers, cross-attention, projections) |
-| `leefrag/model/block_attention.py` | Attention mask builders (block causal, prefix causal) |
-| `leefrag/utils/kv_cache_utils.py` | KV cache extraction, concatenation, RoPE application |
-| `leefrag/config.py` | ModelConfig, QFormerConfig, TrainingConfig dataclasses |
-| `leefrag/training/scheduler.py` | CompressionScheduler (ratio schedule + LR warm-restart) |
+| File | Path from here | Purpose |
+|------|----------------|---------|
+| `leefrag/training/npt_trainer.py` | `../leefrag/training/npt_trainer.py` | NPT training loop (Stage A/B, loss, LR schedule, eval) |
+| `leefrag/data/npt_collator.py` | `../leefrag/data/npt_collator.py` | NPT data collation (continuation building, label construction) |
+| `scripts/train_npt_timed.py` | `../scripts/train_npt_timed.py` | Timed NPT entry point (5-min budget, auto-detects model arch) |
+| `scripts/train_npt.py` | `../scripts/train_npt.py` | Epoch-based NPT entry point (for reference) |
+| `leefrag/model/qformer.py` | `../leefrag/model/qformer.py` | Q-Former architecture (layers, cross-attention, projections) |
+| `leefrag/model/block_attention.py` | `../leefrag/model/block_attention.py` | Attention mask builders (block causal, prefix causal) |
+| `leefrag/utils/kv_cache_utils.py` | `../leefrag/utils/kv_cache_utils.py` | KV cache extraction, concatenation, RoPE application |
+| `leefrag/config.py` | `../leefrag/config.py` | ModelConfig, QFormerConfig, TrainingConfig dataclasses |
+| `leefrag/training/scheduler.py` | `../leefrag/training/scheduler.py` | CompressionScheduler (ratio schedule + LR warm-restart) |
 
 ### READ-ONLY — Shared data pipeline (do NOT modify)
 
-| File | Purpose |
-|------|---------|
-| `leefrag/data/dataset.py` | RAGDataset (document parsing, tokenization, train/eval split) |
+| File | Path from here | Purpose |
+|------|----------------|---------|
+| `leefrag/data/dataset.py` | `../leefrag/data/dataset.py` | RAGDataset (document parsing, tokenization, train/eval split) |
 
 ### OFF-LIMITS — Unrelated files (do NOT read or modify)
 
@@ -48,10 +48,12 @@ Everything else in the repo is unrelated to NPT training. Do not touch:
 
 ## Environment
 
+**Working directory is `autoresearch/`** — all paths below are relative to this directory.
+
 Always run scripts with the GPU-specific venv and HuggingFace cache. The venv directory depends on the machine: `../.a100`, `../.v100`, or `../.h100`. Check which exists before running.
 
 ```bash
-HF_HOME=/fs/scratch/PAS2836/lees_stuff/hf_cache ../.a100/bin/python scripts/train_npt_timed.py --no_wandb
+HF_HOME=/fs/scratch/PAS2836/lees_stuff/hf_cache ../.a100/bin/python ../scripts/train_npt_timed.py --no_wandb
 ```
 
 ## Experiment Strategy
@@ -113,10 +115,10 @@ LOOP FOREVER:
 
 1. Look at the git state: the current branch/commit you're on.
 2. Modify editable files with an experimental idea — a single, focused change.
-3. `git commit` (commit before running).
+3. `git commit` — commit message should be a brief hypothesis: what you changed and why you think it will help (e.g. "add residual in cross-attn: gradient flow to early queries is weak").
 4. Run the experiment:
    ```bash
-   HF_HOME=/fs/scratch/PAS2836/lees_stuff/hf_cache ../.a100/bin/python scripts/train_npt_timed.py --no_wandb
+   HF_HOME=/fs/scratch/PAS2836/lees_stuff/hf_cache ../.a100/bin/python ../scripts/train_npt_timed.py --no_wandb
    ```
 5. Read the results from the output. The script prints a machine-readable summary at the end.
 6. If the run crashed, read the error from the output.
@@ -145,3 +147,35 @@ d4e5f6g	0.000000	0	h100	crash	double model width (OOM)
 ```
 
 Columns: short commit hash, eval_ce_loss, total_steps, device (h100/a100/v100), `keep`/`discard`/`crash`/`baseline`, short description.
+
+## Allowed Tools
+
+Your `.claude/settings.json` grants you a limited set of auto-approved tools. **Use these exact command patterns to avoid permission prompts that block the autonomous loop.**
+
+### Always available (no restrictions)
+- **Read** — read any file
+- **Edit** — edit files in place
+- **Write** — create/overwrite files (use for `results.tsv`)
+- **Glob** — find files by pattern
+- **Grep** — search file contents
+
+### Bash — allowed patterns only
+
+These are the only Bash commands that will run without prompting. Use them exactly as shown:
+
+| Action | Command pattern |
+|--------|----------------|
+| Check venvs | `ls ../.a100 ../.v100 ../.h100` |
+| Run experiment | `HF_HOME=/fs/scratch/PAS2836/lees_stuff/hf_cache ../.{a100,v100,h100}/bin/python ../scripts/train_npt_timed.py --no_wandb` |
+| Git (from repo root) | `cd .. && git status`, `cd .. && git add ...`, `cd .. && git commit ...`, etc. |
+| Git status | `git status` |
+| Git diff | `git diff` or `git diff --staged` |
+| Git log | `git log --oneline -10` |
+| Git add | `git add ../path/to/file` |
+| Git commit | `git commit -m "message"` |
+| Git reset | `git reset --hard HEAD~1` |
+| Kill process | `kill <pid>` |
+
+**Tip**: Since the git repo root is `../`, you can prefix any git command with `cd .. &&` if needed (e.g. `cd .. && git add -A && git commit -m "..."`). Both forms are allowed.
+
+**Any Bash command not matching these patterns will prompt for human approval and block the loop.** If you need to inspect files, use Read/Grep/Glob instead of `cat`/`grep`/`find`.

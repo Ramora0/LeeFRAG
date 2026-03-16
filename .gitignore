@@ -1,5 +1,6 @@
 .venv/
 .claude/
+!autoresearch/.claude/
 __pycache__/
 *.egg-info/
 outputs/
