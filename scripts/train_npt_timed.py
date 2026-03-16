@@ -67,10 +67,8 @@ def parse_args():
     # Dataset
     parser.add_argument("--dataset", type=str, default="slimpajama",
                         choices=["rag_v1", "hotpotqa", "slimpajama"])
-    parser.add_argument("--train_samples", type=int, default=0,
-                        help="Number of training chunks (0 = unlimited)")
-    parser.add_argument("--eval_samples", type=int, default=200,
-                        help="Number of eval chunks")
+    parser.add_argument("--max_documents", type=int, default=500,
+                        help="Max documents to process (0 = unlimited, split into train/eval)")
 
     # Training
     parser.add_argument("--output_dir", type=str, default="outputs_npt_timed")
@@ -201,7 +199,7 @@ def main():
         split="train",
         eval_split_ratio=training_config.eval_split_ratio,
         seed=training_config.seed,
-        max_chunks=args.train_samples,
+        max_documents=args.max_documents,
     )
     eval_dataset = create_dataset(
         dataset_name=args.dataset,
@@ -210,7 +208,7 @@ def main():
         split="eval",
         eval_split_ratio=training_config.eval_split_ratio,
         seed=training_config.seed,
-        max_chunks=args.eval_samples,
+        max_documents=args.max_documents,
     )
     logger.info(f"Train: {len(train_dataset)} samples, Eval: {len(eval_dataset)} samples")
 

@@ -92,7 +92,7 @@ grep "^eval_ce_loss:\|^peak_vram_mb:\|^total_steps:" run.log
 - `--kl_weight`, `--kl_top_k` — KL loss tuning
 - `--gradient_checkpoint_llm` — save GPU memory in Stage B
 - `--offload_stage_a_to_cpu` — move Stage A outputs to CPU between stages
-- `--eval_samples N` — cap eval set size (default: 200)
+- `--max_documents N` — cap total documents before train/eval split (default: 500)
 
 ### Output format
 
@@ -126,6 +126,8 @@ Primary metric is `eval_ce_loss` (lower is better). This is CE loss on all conti
 6. Log results to `autoresearch/results.tsv` (do NOT commit this file).
 
 ## Results Tracking
+
+If `autoresearch/results.tsv` does not exist, copy `autoresearch/base.tsv` into `autoresearch/results.tsv` before starting.
 
 Log each experiment to `autoresearch/results.tsv` (tab-separated):
 

@@ -251,7 +251,7 @@ class GeneralTextDataset(Dataset):
         eval_split_ratio: float = 0.1,
         seed: int = 42,
         sources: tuple[str, ...] = ("book", "arxiv"),
-        max_chunks: int = 0,
+        max_documents: int = 0,
         max_continuation_tokens: int = 1024,
         min_chars: int = 4000,
     ):
@@ -276,13 +276,16 @@ class GeneralTextDataset(Dataset):
         ds = ds.filter(_source_filter, num_proc=4, desc="Filtering by source")
         ds = ds.shuffle(seed=seed)
 
+        if max_documents > 0:
+            ds = ds.select(range(min(max_documents, len(ds))))
+
         split_idx = int(len(ds) * (1 - eval_split_ratio))
         if split == "train":
             raw_data = ds.select(range(split_idx))
         else:
             raw_data = ds.select(range(split_idx, len(ds)))
 
-        # Tokenize docs and chunk into fixed-size windows, stop when we have enough
+        # Tokenize docs and chunk into fixed-size windows
         window = model_config.max_total_doc_tokens + max_continuation_tokens
         self.chunks = []
         for i in range(len(raw_data)):
@@ -291,10 +294,6 @@ class GeneralTextDataset(Dataset):
                 continue
             for start in range(0, len(token_ids) - 256, window):
                 self.chunks.append(token_ids[start : start + window])
-                if max_chunks > 0 and len(self.chunks) >= max_chunks:
-                    break
-            if max_chunks > 0 and len(self.chunks) >= max_chunks:
-                break
 
         logger.info(
             f"GeneralTextDataset ({split}): {len(self.chunks)} chunks"
