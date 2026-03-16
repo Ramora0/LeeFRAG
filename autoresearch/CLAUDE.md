@@ -39,6 +39,19 @@ Everything else in the repo is unrelated to NPT training. Do not touch:
 - `scripts/train.py`, `scripts/absorber_train.py`, `scripts/train_reconstruction.py`
 - `slurms/`, `docs/`, `CLAUDE.md` (root), `pyproject.toml`
 
+## Environment
+
+Always run scripts with the shared venv and HuggingFace cache:
+
+```bash
+HF_HOME=/fs/scratch/PAS2836/lees_stuff/hf_cache ../.venv/bin/python scripts/train_npt_timed.py ...
+```
+
+## Experiment Strategy
+
+- **Architecture changes** (Q-Former structure, attention, projections): Use `meta-llama/Llama-3.2-1B` (default). Fast iteration, ~5 min per experiment.
+- **Hyperparameter tuning** (LR, schedules, loss weights, compression ratios): Use `--model_name ldsjmdy/Tulu3-Block-FT` (LLaMA 3.1 8B). Slower but results transfer directly to production.
+
 ## NPT Training Overview
 
 The NPT trainer compresses document KV caches via a Q-Former so a frozen LLM can predict continuation text from the compressed prefix. Unlike RAG fine-tuning which only supervises answer tokens, NPT supervises ALL continuation tokens.
@@ -53,7 +66,7 @@ The NPT trainer compresses document KV caches via a Q-Former so a frozen LLM can
 ### Run command
 
 ```bash
-python scripts/train_npt_timed.py --no_wandb > run.log 2>&1
+HF_HOME=/fs/scratch/PAS2836/lees_stuff/hf_cache ../.venv/bin/python scripts/train_npt_timed.py --no_wandb > run.log 2>&1
 ```
 
 Training runs for a **fixed 5-minute time budget**. Evaluation runs after training completes and is NOT counted against the budget. Extract results:
