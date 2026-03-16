@@ -30,7 +30,7 @@ logging.disable(logging.CRITICAL)
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from leefrag.config import ModelConfig
@@ -51,8 +51,8 @@ def parse_args():
     parser.add_argument("--model_name", type=str, default="meta-llama/Llama-3.2-1B")
     parser.add_argument("--dataset", type=str, default="slimpajama",
                         choices=["rag_v1", "hotpotqa", "slimpajama"])
-    parser.add_argument("--max_samples", type=int, default=300)
-    parser.add_argument("--eval_samples", type=int, default=400)
+    parser.add_argument("--eval_samples", type=int, default=200,
+                        help="Number of eval chunks")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
@@ -96,7 +96,7 @@ def main():
         hidden_size=hf_config.hidden_size,
     )
 
-    # Load eval dataset
+    # Load eval dataset — eval_samples directly controls chunk count
     eval_dataset = create_dataset(
         dataset_name=args.dataset,
         tokenizer=tokenizer,
@@ -104,11 +104,8 @@ def main():
         split="eval",
         eval_split_ratio=0.1,
         seed=args.seed,
-        max_samples=args.max_samples,
+        max_chunks=args.eval_samples,
     )
-
-    if args.eval_samples > 0 and len(eval_dataset) > args.eval_samples:
-        eval_dataset = Subset(eval_dataset, range(args.eval_samples))
 
     collator = NPTCollator(tokenizer)
     eval_loader = DataLoader(

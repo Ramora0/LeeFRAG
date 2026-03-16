@@ -1,3 +1,5 @@
 commit	eval_ce_loss	total_steps	status	description
+baseline	1.800757	0	baseline	raw LLM, no compression or training
 baseline	1.297130	139	baseline	1x compression (no loss, ceiling)
+baseline	1.391349	206	baseline	2x compression baseline
 baseline	1.462489	250	baseline	4x compression baseline

@@ -251,7 +251,7 @@ class GeneralTextDataset(Dataset):
         eval_split_ratio: float = 0.1,
         seed: int = 42,
         sources: tuple[str, ...] = ("book", "arxiv"),
-        max_samples: int = 0,
+        max_chunks: int = 0,
         max_continuation_tokens: int = 1024,
         min_chars: int = 4000,
     ):
@@ -276,36 +276,28 @@ class GeneralTextDataset(Dataset):
         ds = ds.filter(_source_filter, num_proc=4, desc="Filtering by source")
         ds = ds.shuffle(seed=seed)
 
-        if max_samples > 0:
-            ds = ds.select(range(min(max_samples, len(ds))))
-
         split_idx = int(len(ds) * (1 - eval_split_ratio))
         if split == "train":
             raw_data = ds.select(range(split_idx))
         else:
             raw_data = ds.select(range(split_idx, len(ds)))
 
-        # Tokenize all documents upfront and chunk into fixed-size windows
+        # Tokenize docs and chunk into fixed-size windows, stop when we have enough
         window = model_config.max_total_doc_tokens + max_continuation_tokens
-        logger.info(f"Batch-tokenizing {len(raw_data)} documents...")
-        all_texts = [raw_data[i]["text"] for i in range(len(raw_data))]
-        all_token_ids = tokenizer(
-            all_texts, add_special_tokens=False,
-        )["input_ids"]
-        del all_texts
-        logger.info("Tokenization complete, chunking...")
-
-        self.chunks = []  # list of token id lists, one per chunk
-        for token_ids in tqdm(all_token_ids, desc="Chunking docs"):
+        self.chunks = []
+        for i in range(len(raw_data)):
+            token_ids = tokenizer.encode(raw_data[i]["text"], add_special_tokens=False)
             if len(token_ids) < 256:
                 continue
             for start in range(0, len(token_ids) - 256, window):
                 self.chunks.append(token_ids[start : start + window])
-        del all_token_ids
+                if max_chunks > 0 and len(self.chunks) >= max_chunks:
+                    break
+            if max_chunks > 0 and len(self.chunks) >= max_chunks:
+                break
 
         logger.info(
-            f"GeneralTextDataset ({split}): {len(raw_data)} docs → "
-            f"{len(self.chunks)} chunks"
+            f"GeneralTextDataset ({split}): {len(self.chunks)} chunks"
         )
 
     def __len__(self) -> int:

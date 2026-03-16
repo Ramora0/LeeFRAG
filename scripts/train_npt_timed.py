@@ -33,7 +33,7 @@ logging.disable(logging.CRITICAL)
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from leefrag.config import ModelConfig, QFormerConfig, TrainingConfig
@@ -67,10 +67,10 @@ def parse_args():
     # Dataset
     parser.add_argument("--dataset", type=str, default="slimpajama",
                         choices=["rag_v1", "hotpotqa", "slimpajama"])
-    parser.add_argument("--max_samples", type=int, default=300,
-                        help="Max dataset samples before split (0 = unlimited)")
-    parser.add_argument("--eval_samples", type=int, default=400,
-                        help="Max eval samples (0 = use full eval set)")
+    parser.add_argument("--train_samples", type=int, default=0,
+                        help="Number of training chunks (0 = unlimited)")
+    parser.add_argument("--eval_samples", type=int, default=200,
+                        help="Number of eval chunks")
 
     # Training
     parser.add_argument("--output_dir", type=str, default="outputs_npt_timed")
@@ -201,7 +201,7 @@ def main():
         split="train",
         eval_split_ratio=training_config.eval_split_ratio,
         seed=training_config.seed,
-        max_samples=args.max_samples,
+        max_chunks=args.train_samples,
     )
     eval_dataset = create_dataset(
         dataset_name=args.dataset,
@@ -210,13 +210,9 @@ def main():
         split="eval",
         eval_split_ratio=training_config.eval_split_ratio,
         seed=training_config.seed,
-        max_samples=args.max_samples,
+        max_chunks=args.eval_samples,
     )
     logger.info(f"Train: {len(train_dataset)} samples, Eval: {len(eval_dataset)} samples")
-
-    if args.eval_samples > 0 and len(eval_dataset) > args.eval_samples:
-        eval_dataset = Subset(eval_dataset, range(args.eval_samples))
-        logger.info(f"Eval capped to {args.eval_samples} samples")
 
     collator = NPTCollator(tokenizer)
     train_loader = DataLoader(
