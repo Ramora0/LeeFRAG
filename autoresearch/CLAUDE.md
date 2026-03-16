@@ -52,8 +52,13 @@ Everything else in the repo is unrelated to NPT training. Do not touch:
 
 Always run scripts with the GPU-specific venv and HuggingFace cache. The venv directory depends on the machine: `../.a100`, `../.v100`, or `../.h100`. Check which exists before running.
 
+Time budgets vary by GPU:
+- **H100**: `--time_budget 300` (5 min, default)
+- **A100**: `--time_budget 600` (10 min)
+- **V100**: `--time_budget 1200` (20 min)
+
 ```bash
-HF_HOME=/fs/scratch/PAS2836/lees_stuff/hf_cache ../.a100/bin/python ../scripts/train_npt_timed.py --no_wandb
+HF_HOME=/fs/scratch/PAS2836/lees_stuff/hf_cache ../.a100/bin/python ../scripts/train_npt_timed.py --no_wandb --time_budget 600
 ```
 
 ## Experiment Strategy
@@ -127,6 +132,8 @@ LOOP FOREVER:
 7. Record the results in `autoresearch/results.tsv` (do NOT commit this file).
 8. If eval_ce_loss improved (lower), keep the change — advance the branch.
 9. If eval_ce_loss is equal or worse, `git reset --hard` back to where you started.
+
+**GPU switching**: Results are only comparable on the same GPU. If you're on a different GPU than the current best result was run on, re-run the current code first to establish a comparable baseline before making changes.
 
 **Timeout**: Each experiment should take ~5 minutes (+ startup/eval overhead). If a run exceeds 10 minutes, kill it and treat as failure (discard and revert).
 
