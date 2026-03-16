@@ -12,7 +12,8 @@ These are the only files you are allowed to change:
 |------|---------|
 | `leefrag/training/npt_trainer.py` | NPT training loop (Stage A/B, loss, LR schedule, eval) |
 | `leefrag/data/npt_collator.py` | NPT data collation (continuation building, label construction) |
-| `scripts/train_npt.py` | NPT entry point (arg parsing, model/data setup, trainer init) |
+| `scripts/train_npt_timed.py` | Timed NPT entry point (5-min budget, auto-detects model arch) |
+| `scripts/train_npt.py` | Epoch-based NPT entry point (for reference) |
 | `leefrag/model/qformer.py` | Q-Former architecture (layers, cross-attention, projections) |
 | `leefrag/model/block_attention.py` | Attention mask builders (block causal, prefix causal) |
 | `leefrag/utils/kv_cache_utils.py` | KV cache extraction, concatenation, RoPE application |
@@ -40,7 +41,9 @@ Everything else in the repo is unrelated to NPT training. Do not touch:
 
 ## NPT Training Overview
 
-The NPT trainer compresses document KV caches via a Q-Former so a frozen LLM (LLaMA 3.1 8B) can predict continuation text from the compressed prefix. Unlike RAG fine-tuning which only supervises answer tokens, NPT supervises ALL continuation tokens.
+The NPT trainer compresses document KV caches via a Q-Former so a frozen LLM can predict continuation text from the compressed prefix. Unlike RAG fine-tuning which only supervises answer tokens, NPT supervises ALL continuation tokens.
+
+**Default frozen LLM**: `meta-llama/Llama-3.2-1B` (16 layers, 2048 hidden, 8 KV heads, head_dim 64). Architecture is auto-detected from the model.
 
 ### Two-stage forward pass
 
@@ -50,23 +53,49 @@ The NPT trainer compresses document KV caches via a Q-Former so a frozen LLM (LL
 ### Run command
 
 ```bash
-python scripts/train_npt.py --gradient_checkpoint_llm --no_wandb
+python scripts/train_npt_timed.py --no_wandb > run.log 2>&1
+```
+
+Training runs for a **fixed 5-minute time budget**. Evaluation runs after training completes and is NOT counted against the budget. Extract results:
+
+```bash
+grep "^eval_ce_loss:\|^peak_vram_mb:\|^total_steps:" run.log
 ```
 
 ### Key args
 
-- `--compression_schedule 2 4 8 16` — ratio progression (each phase gets equal steps)
+- `--model_name MODEL` — HuggingFace model (default: `meta-llama/Llama-3.2-1B`)
+- `--time_budget SECONDS` — wall-clock training budget (default: 300)
+- `--compression_schedule 2 4 8 16` — ratio progression (each phase gets equal time)
 - `--cross_attn_mode global|chunked` — Q-Former cross-attention strategy
 - `--scale N` — multiply Q-Former attn_dim/ffn_dim by N
 - `--ce_only` — disable KL loss
 - `--kl_weight`, `--kl_top_k` — KL loss tuning
 - `--gradient_checkpoint_llm` — save GPU memory in Stage B
 - `--offload_stage_a_to_cpu` — move Stage A outputs to CPU between stages
-- `--resume_from PATH` — resume from checkpoint
+- `--eval_samples N` — cap eval set size (default: 200)
+
+### Output format
+
+The script prints a machine-readable summary after eval:
+
+```
+---
+eval_ce_loss:       2.345678
+eval_kl_loss:       0.123456
+eval_total_loss:    2.469134
+eval_perplexity:    10.43
+training_seconds:   300.1
+total_seconds:      325.9
+peak_vram_mb:       4500.2
+total_steps:        1234
+model:              meta-llama/Llama-3.2-1B
+qformer_params_M:   1.2
+```
 
 ### Metric
 
-Primary metric is eval CE loss (lower is better). Logged every `eval_steps` (default: 4x per epoch).
+Primary metric is `eval_ce_loss` (lower is better). This is CE loss on all continuation tokens at the final compression ratio.
 
 ## Experimentation Rules
 
@@ -82,10 +111,10 @@ Primary metric is eval CE loss (lower is better). Logged every `eval_steps` (def
 Log each experiment to `autoresearch/results.tsv` (tab-separated):
 
 ```
-commit	eval_loss	status	description
-a1b2c3d	2.345678	keep	baseline
-b2c3d4e	2.310000	keep	increase gradient accumulation to 16
-c3d4e5f	2.400000	discard	switch to chunked cross-attn
+commit	eval_ce_loss	memory_gb	status	description
+a1b2c3d	2.345678	4.4	keep	baseline
+b2c3d4e	2.310000	4.5	keep	increase gradient accumulation to 16
+c3d4e5f	2.400000	4.4	discard	switch to chunked cross-attn
 ```
 
-Columns: short commit hash, eval loss, `keep`/`discard`/`crash`, description.
+Columns: short commit hash, eval_ce_loss, peak memory in GB (peak_vram_mb / 1024), `keep`/`discard`/`crash`, description.

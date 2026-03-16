@@ -1,6 +1,7 @@
 import logging
 import math
 import os
+import time
 
 import torch
 import torch.nn.functional as F
@@ -223,6 +224,122 @@ class NPTTrainer:
         self._save_checkpoint(global_step, compression_ratio)
         logger.info("Training complete.")
 
+    def train_timed(self, time_budget: float) -> int:
+        """Time-budgeted training loop.
+
+        Trains until wall-clock budget is exhausted. LR and compression
+        schedule are driven by elapsed time fraction, not step count.
+
+        Args:
+            time_budget: Training time in seconds.
+
+        Returns:
+            Number of optimizer steps completed.
+        """
+        self.model.eval()
+        self.qformer.train()
+
+        global_step = 0
+        accumulation_count = 0
+        accum_loss = 0.0
+        accum_ce = 0.0
+        accum_kl = 0.0
+        accum_empirical_ratio = 0.0
+        accum_micro_batches = 0
+
+        start_time = time.monotonic()
+        deadline = start_time + time_budget
+        epoch = 0
+        prev_phase = -1
+
+        while time.monotonic() < deadline:
+            epoch += 1
+            for batch in self.train_loader:
+                if time.monotonic() >= deadline:
+                    break
+
+                elapsed = time.monotonic() - start_time
+                progress = min(elapsed / time_budget, 1.0)
+
+                compression_ratio = self.compression_scheduler.get_compression_ratio_by_progress(progress)
+                phase = self.compression_scheduler.get_phase_by_progress(progress)
+                if phase != prev_phase:
+                    logger.info(
+                        f"Phase {phase}: compression={compression_ratio}x "
+                        f"at {elapsed:.0f}s ({progress*100:.0f}%)"
+                    )
+                    prev_phase = phase
+
+                loss = self._training_step(batch, compression_ratio)
+                if loss is None:
+                    continue
+
+                loss = loss / self.training_config.gradient_accumulation_steps
+                self.scaler.scale(loss).backward()
+
+                accumulation_count += 1
+                accum_loss += loss.item() * self.training_config.gradient_accumulation_steps
+                accum_ce += self._last_ce_loss
+                accum_kl += self._last_kl_loss
+                accum_empirical_ratio += self._last_empirical_ratio
+                accum_micro_batches += 1
+
+                if accumulation_count % self.training_config.gradient_accumulation_steps == 0:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        self.qformer.parameters(),
+                        self.training_config.max_grad_norm,
+                    )
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                    self.optimizer.zero_grad()
+
+                    self._update_lr_by_progress(progress)
+                    global_step += 1
+
+                    if accum_micro_batches > 0:
+                        avg_loss = accum_loss / accum_micro_batches
+                        avg_ce = accum_ce / accum_micro_batches
+                        avg_kl = accum_kl / accum_micro_batches
+
+                        if global_step % self.training_config.logging_steps == 0:
+                            lr = self.optimizer.param_groups[0]["lr"]
+                            remaining = deadline - time.monotonic()
+                            logger.info(
+                                f"step={global_step} loss={avg_loss:.4f} "
+                                f"ce={avg_ce:.4f} kl={avg_kl:.4f} "
+                                f"lr={lr:.2e} comp={compression_ratio}x "
+                                f"epoch={epoch} remaining={remaining:.0f}s"
+                            )
+
+                            if self.use_wandb:
+                                import wandb
+                                wandb.log({
+                                    "train/loss": avg_loss,
+                                    "train/ce_loss": avg_ce,
+                                    "train/kl_loss": avg_kl,
+                                    "train/lr": lr,
+                                    "train/compression_ratio": compression_ratio,
+                                    "train/progress": progress,
+                                    "train/global_step": global_step,
+                                    "train/epoch": epoch,
+                                })
+
+                        accum_loss = 0.0
+                        accum_ce = 0.0
+                        accum_kl = 0.0
+                        accum_empirical_ratio = 0.0
+                        accum_micro_batches = 0
+
+        # Final checkpoint
+        compression_ratio = self.compression_scheduler.ratios[-1]
+        self._save_checkpoint(global_step, compression_ratio)
+        logger.info(
+            f"Timed training complete: {global_step} steps, "
+            f"{epoch} epochs in {time_budget:.0f}s"
+        )
+        return global_step
+
     def _training_step(
         self, batch: dict, compression_ratio: int,
     ) -> torch.Tensor | None:
@@ -444,6 +561,25 @@ class NPTTrainer:
         else:
             progress = (phase_step - phase_warmup) / max(1, steps_per_phase - phase_warmup)
             lr_scale = 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        for param_group in self.optimizer.param_groups:
+            param_group["lr"] = self.training_config.learning_rate * lr_scale
+
+    def _update_lr_by_progress(self, progress: float):
+        """Update LR based on time progress [0, 1] with per-phase warm restart."""
+        num_phases = len(self.compression_scheduler.ratios)
+        phase = min(int(progress * num_phases), num_phases - 1)
+        phase_start = phase / num_phases
+        phase_end = (phase + 1) / num_phases
+        phase_progress = (progress - phase_start) / (phase_end - phase_start)
+        phase_progress = min(max(phase_progress, 0.0), 1.0)
+
+        warmup_frac = self.training_config.warmup_ratio
+        if phase_progress < warmup_frac:
+            lr_scale = phase_progress / max(warmup_frac, 1e-8)
+        else:
+            cosine_progress = (phase_progress - warmup_frac) / max(1.0 - warmup_frac, 1e-8)
+            lr_scale = 0.5 * (1.0 + math.cos(math.pi * cosine_progress))
 
         for param_group in self.optimizer.param_groups:
             param_group["lr"] = self.training_config.learning_rate * lr_scale

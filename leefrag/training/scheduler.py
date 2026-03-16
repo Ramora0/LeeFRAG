@@ -21,3 +21,12 @@ class CompressionScheduler:
     def get_phase(self, step: int) -> int:
         """Return the current phase index (0-based)."""
         return min(step // self.steps_per_phase, len(self.ratios) - 1)
+
+    def get_compression_ratio_by_progress(self, progress: float) -> int:
+        """Return the compression ratio for a time-based progress fraction [0, 1]."""
+        phase_idx = min(int(progress * len(self.ratios)), len(self.ratios) - 1)
+        return self.ratios[phase_idx]
+
+    def get_phase_by_progress(self, progress: float) -> int:
+        """Return the current phase index for a time-based progress fraction [0, 1]."""
+        return min(int(progress * len(self.ratios)), len(self.ratios) - 1)
