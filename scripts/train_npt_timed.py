@@ -287,4 +287,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        sys.stderr = _real_stderr
+        import traceback
+        print("\n--- ERROR ---", file=sys.stderr)
+        traceback.print_exc()
+        sys.exit(1)
