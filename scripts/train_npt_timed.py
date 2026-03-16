@@ -52,7 +52,7 @@ def parse_args():
                         help="Training time budget in seconds (default: 300 = 5 min)")
 
     # Dataset
-    parser.add_argument("--dataset", type=str, default="rag_v1",
+    parser.add_argument("--dataset", type=str, default="slimpajama",
                         choices=["rag_v1", "hotpotqa", "slimpajama"])
     parser.add_argument("--eval_samples", type=int, default=200,
                         help="Max eval samples (0 = use full eval set)")
@@ -68,12 +68,12 @@ def parse_args():
     parser.add_argument("--offload_stage_a_to_cpu", action="store_true")
 
     # Loss
-    parser.add_argument("--ce_only", action="store_true")
+    parser.add_argument("--ce_only", action="store_true", default=True)
     parser.add_argument("--kl_weight", type=float, default=1.0)
     parser.add_argument("--kl_top_k", type=int, default=0)
 
     # Compression
-    parser.add_argument("--compression_schedule", type=int, nargs="+", default=[2, 4, 8, 16])
+    parser.add_argument("--compression_schedule", type=int, nargs="+", default=[4])
 
     # Q-Former
     parser.add_argument("--cross_attn_mode", type=str, default="global",

@@ -44,7 +44,7 @@ Everything else in the repo is unrelated to NPT training. Do not touch:
 Always run scripts with the shared venv and HuggingFace cache:
 
 ```bash
-HF_HOME=/fs/scratch/PAS2836/lees_stuff/hf_cache ../.venv/bin/python scripts/train_npt_timed.py ...
+HF_HOME=/fs/scratch/PAS2836/lees_stuff/hf_cache ../.a100/bin/python scripts/train_npt_timed.py ...
 ```
 
 ## Experiment Strategy
