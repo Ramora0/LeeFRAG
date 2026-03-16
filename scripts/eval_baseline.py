@@ -1,7 +1,7 @@
 """Uncompressed baseline: CE loss of the raw LLM on context + continuation.
 
-No Q-Former, no compression. Just runs the frozen LLM on the full
-[context | continuation] sequence and computes CE on continuation tokens.
+No Q-Former, no compression. Runs the frozen LLM with standard causal
+attention on [context | continuation] and computes CE on continuation tokens.
 This is the theoretical ceiling — compressed results can only be worse.
 
 Usage:
@@ -51,8 +51,8 @@ def parse_args():
     parser.add_argument("--model_name", type=str, default="meta-llama/Llama-3.2-1B")
     parser.add_argument("--dataset", type=str, default="slimpajama",
                         choices=["rag_v1", "hotpotqa", "slimpajama"])
-    parser.add_argument("--max_samples", type=int, default=0)
-    parser.add_argument("--eval_samples", type=int, default=200)
+    parser.add_argument("--max_samples", type=int, default=300)
+    parser.add_argument("--eval_samples", type=int, default=400)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
@@ -120,7 +120,7 @@ def main():
         pin_memory=True,
     )
 
-    # Eval: full forward pass on [context | continuation], CE on continuation
+    # Eval: standard causal forward on [preamble | context | continuation]
     total_ce = 0.0
     num_batches = 0
 
@@ -134,7 +134,7 @@ def main():
             if not doc_token_ids or sum(batch["doc_lengths"]) == 0:
                 continue
 
-            # Concatenate: [preamble | docs | continuation]
+            # [preamble | context | continuation] — plain causal, no block mask
             doc_concat = torch.cat(doc_token_ids, dim=0).unsqueeze(0).to(device)
             preamble = preamble_ids.unsqueeze(0).to(device)
             full_input = torch.cat([preamble, doc_concat, continuation_ids], dim=1)

@@ -1,0 +1,3 @@
+commit	eval_ce_loss	total_steps	status	description
+baseline	1.297130	139	baseline	1x compression (no loss, ceiling)
+baseline	1.462489	250	baseline	4x compression baseline

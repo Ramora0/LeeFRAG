@@ -67,9 +67,9 @@ def parse_args():
     # Dataset
     parser.add_argument("--dataset", type=str, default="slimpajama",
                         choices=["rag_v1", "hotpotqa", "slimpajama"])
-    parser.add_argument("--max_samples", type=int, default=0,
+    parser.add_argument("--max_samples", type=int, default=300,
                         help="Max dataset samples before split (0 = unlimited)")
-    parser.add_argument("--eval_samples", type=int, default=200,
+    parser.add_argument("--eval_samples", type=int, default=400,
                         help="Max eval samples (0 = use full eval set)")
 
     # Training

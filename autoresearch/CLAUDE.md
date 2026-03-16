@@ -130,10 +130,10 @@ Primary metric is `eval_ce_loss` (lower is better). This is CE loss on all conti
 Log each experiment to `autoresearch/results.tsv` (tab-separated):
 
 ```
-commit	eval_ce_loss	memory_gb	status	description
-a1b2c3d	2.345678	4.4	keep	baseline
-b2c3d4e	2.310000	4.5	keep	increase gradient accumulation to 16
-c3d4e5f	2.400000	4.4	discard	switch to chunked cross-attn
+commit	eval_ce_loss	total_steps	status	description
+a1b2c3d	2.345678	250	keep	baseline
+b2c3d4e	2.310000	240	keep	increase gradient accumulation to 16
+c3d4e5f	2.400000	260	discard	switch to chunked cross-attn
 ```
 
-Columns: short commit hash, eval_ce_loss, peak memory in GB (peak_vram_mb / 1024), `keep`/`discard`/`crash`, description.
+Columns: short commit hash, eval_ce_loss, total_steps (from training), `keep`/`discard`/`crash`, description.
