@@ -226,8 +226,8 @@ class GeneralTextDataset(Dataset):
     """General text dataset for NPT pretraining (SlimPajama, following ReFRAG).
 
     Loads text from SlimPajama-6B, filters by source domain (Book + ArXiv by
-    default), and splits each text into context (compressed by Q-Former as a
-    single sequence) and continuation (prediction target).
+    default). Long documents are chunked with a stride into multiple examples,
+    each split into context (compressed by Q-Former) and continuation (target).
 
     No block attention chunking — context is treated as one contiguous sequence.
     """
@@ -280,24 +280,35 @@ class GeneralTextDataset(Dataset):
 
         split_idx = int(len(ds) * (1 - eval_split_ratio))
         if split == "train":
-            self.data = ds.select(range(split_idx))
+            raw_data = ds.select(range(split_idx))
         else:
-            self.data = ds.select(range(split_idx, len(ds)))
+            raw_data = ds.select(range(split_idx, len(ds)))
 
-        logger.info(f"GeneralTextDataset ({split}): {len(self.data)} samples")
+        # Tokenize all documents upfront and chunk into fixed-size windows
+        window = model_config.max_total_doc_tokens + max_continuation_tokens
+        self.chunks = []  # list of token id lists, one per chunk
+        for doc_idx in range(len(raw_data)):
+            token_ids = tokenizer.encode(
+                raw_data[doc_idx]["text"], add_special_tokens=False,
+            )
+            if len(token_ids) < 256:
+                continue
+            for start in range(0, len(token_ids) - 256, window):
+                self.chunks.append(token_ids[start : start + window])
+
+        logger.info(
+            f"GeneralTextDataset ({split}): {len(raw_data)} docs → "
+            f"{len(self.chunks)} chunks"
+        )
 
     def __len__(self) -> int:
-        return len(self.data)
+        return len(self.chunks)
 
     def __getitem__(self, idx: int) -> dict:
-        text = self.data[idx]["text"]
-        token_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        token_ids = self.chunks[idx]
 
         max_context = self.config.max_total_doc_tokens
         max_cont = self.max_continuation_tokens
-
-        # Truncate to fit context + continuation
-        token_ids = token_ids[: max_context + max_cont]
 
         # Split: context gets up to max_context, rest is continuation
         context_len = min(len(token_ids) - 128, max_context)

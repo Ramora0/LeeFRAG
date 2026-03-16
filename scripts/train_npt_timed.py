@@ -16,6 +16,20 @@ import math
 import os
 import random
 import time
+import warnings
+
+# Nuclear silence: redirect stderr to /dev/null during setup/training,
+# restore only for final summary which goes to stdout
+import sys
+_real_stderr = sys.stderr
+_devnull = open(os.devnull, "w")
+
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+os.environ["DATASETS_VERBOSITY"] = "error"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["TQDM_DISABLE"] = "1"
+warnings.filterwarnings("ignore")
+logging.disable(logging.CRITICAL)
 
 import numpy as np
 import torch
@@ -28,7 +42,6 @@ from leefrag.data.npt_collator import NPTCollator
 from leefrag.model.qformer import QFormerKVCompressor
 from leefrag.training.npt_trainer import NPTTrainer
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 
@@ -84,11 +97,25 @@ def parse_args():
     # Resume
     parser.add_argument("--resume_from", type=str, default=None)
 
+    # Output
+    parser.add_argument("--verbose", action="store_true",
+                        help="Enable full logging (default: quiet, only prints final summary)")
+
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+
+    if args.verbose:
+        logging.disable(logging.NOTSET)
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+        os.environ["TRANSFORMERS_VERBOSITY"] = "info"
+        os.environ["DATASETS_VERBOSITY"] = "info"
+        del os.environ["TQDM_DISABLE"]
+    else:
+        sys.stderr = _devnull
+
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -253,14 +280,13 @@ def main():
     if torch.cuda.is_available():
         peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
 
-    # Summary
-    kl_weight = training_config.kl_weight
-    eval_total = eval_ce + kl_weight * eval_kl
+    # Restore stderr for summary and any post-run errors
+    sys.stderr = _real_stderr
 
+    # Summary — eval_ce_loss is the primary metric for all comparisons,
+    # regardless of whether KL was used during training
     print("\n---")
     print(f"eval_ce_loss:       {eval_ce:.6f}")
-    print(f"eval_kl_loss:       {eval_kl:.6f}")
-    print(f"eval_total_loss:    {eval_total:.6f}")
     print(f"eval_perplexity:    {math.exp(min(eval_ce, 20)):.2f}")
     print(f"training_seconds:   {training_seconds:.1f}")
     print(f"total_seconds:      {total_seconds:.1f}")

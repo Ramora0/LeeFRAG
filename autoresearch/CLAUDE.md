@@ -41,6 +41,12 @@ Everything else in the repo is unrelated to NPT training. Do not touch:
 
 ## Environment
 
+The HuggingFace token is stored in `../.env`. Before running any scripts, export it:
+
+```bash
+export HF_TOKEN=$(grep HF_TOKEN ../.env | cut -d= -f2)
+```
+
 Always run scripts with the shared venv and HuggingFace cache:
 
 ```bash
