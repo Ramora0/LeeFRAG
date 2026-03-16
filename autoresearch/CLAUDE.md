@@ -41,13 +41,7 @@ Everything else in the repo is unrelated to NPT training. Do not touch:
 
 ## Environment
 
-The HuggingFace token is stored in `../.env`. Before running any scripts, export it:
-
-```bash
-export HF_TOKEN=$(grep HF_TOKEN ../.env | cut -d= -f2)
-```
-
-Always run scripts with the shared venv and HuggingFace cache:
+Always run scripts with the GPU-specific venv and HuggingFace cache. The venv directory depends on the machine: `../.a100`, `../.v100`, or `../.h100`. Check which exists before running.
 
 ```bash
 HF_HOME=/fs/scratch/PAS2836/lees_stuff/hf_cache ../.a100/bin/python scripts/train_npt_timed.py ...
@@ -72,7 +66,7 @@ The NPT trainer compresses document KV caches via a Q-Former so a frozen LLM can
 ### Run command
 
 ```bash
-HF_HOME=/fs/scratch/PAS2836/lees_stuff/hf_cache ../.venv/bin/python scripts/train_npt_timed.py --no_wandb > run.log 2>&1
+HF_HOME=/fs/scratch/PAS2836/lees_stuff/hf_cache ../.a100/bin/python scripts/train_npt_timed.py --no_wandb > run.log 2>&1
 ```
 
 Training runs for a **fixed 5-minute time budget**. Evaluation runs after training completes and is NOT counted against the budget. Extract results:

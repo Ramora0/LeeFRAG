@@ -1,7 +1,7 @@
-commit	eval_ce_loss	total_steps	status	description
-baseline	1.800757	0	baseline	raw LLM, no compression or training
-baseline	1.297130	139	baseline	1x compression (ceiling)
-baseline	1.391349	206	baseline	2x compression baseline
-baseline	1.462489	250	baseline	4x compression baseline
-baseline	1.535451	301	baseline	8x compression baseline
-baseline	1.579786	328	baseline	16x compression baseline
+commit	eval_ce_loss	total_steps	device	status	description
+baseline	1.800757	0	h100	baseline	raw LLM, no compression or training
+baseline	1.297130	139	h100	baseline	1x compression (ceiling)
+baseline	1.391349	206	h100	baseline	2x compression baseline
+baseline	1.462489	250	h100	baseline	4x compression baseline
+baseline	1.535451	301	h100	baseline	8x compression baseline
+baseline	1.579786	328	h100	baseline	16x compression baseline
