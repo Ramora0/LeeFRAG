@@ -1,4 +1,6 @@
 .venv/
 .claude/
 __pycache__/
-block-attention.pdf
+*.egg-info/
+outputs/
+docs/block-attention.pdf

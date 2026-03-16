@@ -1,3 +1,5 @@
+import json
+import logging
 import re
 
 import torch
@@ -5,7 +7,9 @@ from datasets import load_dataset
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer
 
-from config import ModelConfig
+from leefrag.config import ModelConfig
+
+logger = logging.getLogger(__name__)
 
 HOTPOTQA_SYSTEM_PROMPT = "Answer the question based on the provided documents. Give a short, direct answer."
 
@@ -218,6 +222,112 @@ class HotPotQADataset(Dataset):
         return doc_token_ids
 
 
+class GeneralTextDataset(Dataset):
+    """General text dataset for NPT pretraining (SlimPajama, following ReFRAG).
+
+    Loads text from SlimPajama-6B, filters by source domain (Book + ArXiv by
+    default), and splits each text into context (compressed by Q-Former as a
+    single sequence) and continuation (prediction target).
+
+    No block attention chunking — context is treated as one contiguous sequence.
+    """
+
+    SOURCES = {
+        "book": "RedPajamaBook",
+        "arxiv": "RedPajamaArXiv",
+        "wikipedia": "RedPajamaWikipedia",
+        "c4": "RedPajamaC4",
+        "commoncrawl": "RedPajamaCommonCrawl",
+        "stackexchange": "RedPajamaStackExchange",
+        "github": "RedPajamaGithub",
+    }
+
+    def __init__(
+        self,
+        tokenizer: PreTrainedTokenizer,
+        model_config: ModelConfig,
+        split: str = "train",
+        eval_split_ratio: float = 0.1,
+        seed: int = 42,
+        sources: tuple[str, ...] = ("book", "arxiv"),
+        max_samples: int = 0,
+        max_continuation_tokens: int = 1024,
+        min_chars: int = 4000,
+    ):
+        self.tokenizer = tokenizer
+        self.config = model_config
+        self.max_continuation_tokens = max_continuation_tokens
+
+        source_names = {self.SOURCES[s] for s in sources}
+
+        logger.info(f"Loading SlimPajama-6B (sources={list(sources)})...")
+        ds = load_dataset("DKYoon/SlimPajama-6B", split="train")
+
+        def _source_filter(example):
+            meta = example["meta"]
+            if isinstance(meta, str):
+                meta = json.loads(meta)
+            return (
+                meta.get("redpajama_set_name") in source_names
+                and len(example["text"]) >= min_chars
+            )
+
+        ds = ds.filter(_source_filter, num_proc=4, desc="Filtering by source")
+        ds = ds.shuffle(seed=seed)
+
+        if max_samples > 0:
+            ds = ds.select(range(min(max_samples, len(ds))))
+
+        split_idx = int(len(ds) * (1 - eval_split_ratio))
+        if split == "train":
+            self.data = ds.select(range(split_idx))
+        else:
+            self.data = ds.select(range(split_idx, len(ds)))
+
+        logger.info(f"GeneralTextDataset ({split}): {len(self.data)} samples")
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+    def __getitem__(self, idx: int) -> dict:
+        text = self.data[idx]["text"]
+        token_ids = self.tokenizer.encode(text, add_special_tokens=False)
+
+        max_context = self.config.max_total_doc_tokens
+        max_cont = self.max_continuation_tokens
+
+        # Truncate to fit context + continuation
+        token_ids = token_ids[: max_context + max_cont]
+
+        # Split: context gets up to max_context, rest is continuation
+        context_len = min(len(token_ids) - 128, max_context)
+        context_len = max(context_len, 1)
+
+        context_ids = token_ids[:context_len]
+        continuation_ids = token_ids[context_len : context_len + max_cont]
+
+        # Single document — no block attention chunking
+        doc_token_ids = [torch.tensor(context_ids, dtype=torch.long)]
+
+        # Minimal preamble: BOS token
+        bos_id = self.tokenizer.bos_token_id
+        if bos_id is not None:
+            preamble_ids = torch.tensor([bos_id], dtype=torch.long)
+        else:
+            preamble_ids = torch.tensor([], dtype=torch.long)
+
+        return {
+            "doc_texts": [],
+            "doc_token_ids": doc_token_ids,
+            "preamble_ids": preamble_ids,
+            "qa_suffix_ids": torch.tensor([], dtype=torch.long),
+            "question_suffix": "",
+            "answer": "",
+            "answer_ids": torch.tensor(continuation_ids, dtype=torch.long),
+            "system_prompt": "",
+        }
+
+
 def create_dataset(
     dataset_name: str,
     tokenizer: PreTrainedTokenizer,
@@ -225,6 +335,7 @@ def create_dataset(
     split: str = "train",
     eval_split_ratio: float = 0.1,
     seed: int = 42,
+    **kwargs,
 ) -> Dataset:
     """Factory function to create the appropriate dataset."""
     if dataset_name == "rag_v1":
@@ -243,5 +354,17 @@ def create_dataset(
             eval_split_ratio=eval_split_ratio,
             seed=seed,
         )
+    elif dataset_name == "slimpajama":
+        return GeneralTextDataset(
+            tokenizer=tokenizer,
+            model_config=model_config,
+            split=split,
+            eval_split_ratio=eval_split_ratio,
+            seed=seed,
+            **kwargs,
+        )
     else:
-        raise ValueError(f"Unknown dataset: {dataset_name!r}. Choose from: rag_v1, hotpotqa")
+        raise ValueError(
+            f"Unknown dataset: {dataset_name!r}. "
+            "Choose from: rag_v1, hotpotqa, slimpajama"
+        )

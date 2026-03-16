@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-from config import ModelConfig, QFormerConfig
+from leefrag.config import ModelConfig, QFormerConfig
 
 
 class QFormerKVCompressor(nn.Module):

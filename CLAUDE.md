@@ -9,6 +9,39 @@ LeeFRAG is a KV cache compression training pipeline for RAG (Retrieval-Augmented
 **Base model**: `ldsjmdy/Tulu3-Block-FT` (LLaMA 3.1 8B with Tulu 3 chat template, frozen during training)
 **Dataset**: `glaiveai/RAG-v1` (loaded via HuggingFace `datasets`)
 
+## Project Structure
+
+```
+leefrag/                    # Python package
+├── config.py               # Shared config (ModelConfig, QFormerConfig, TrainingConfig)
+├── model/                  # Model definitions
+│   ├── qformer.py          # Q-Former KV compressor
+│   └── block_attention.py  # Attention mask builders
+├── data/                   # Data pipeline
+│   ├── dataset.py          # RAGDataset + HotpotQA loading
+│   ├── collator.py         # RAGCollator (Tulu 3 chat template)
+│   └── reconstruction_collator.py
+├── training/               # Training loops
+│   ├── trainer.py          # TwoStageTrainer (main Q-Former training)
+│   ├── absorber_trainer.py # AbsorberLoRATrainer
+│   ├── reconstruction_trainer.py
+│   └── scheduler.py        # Compression ratio schedule
+├── evaluation/             # Eval scripts
+│   ├── eval.py             # Benchmark eval (HotpotQA / RAG-v1)
+│   ├── absorber_eval.py    # Absorber token eval
+│   ├── baseline.py         # Full-context baseline eval
+│   └── eval_prompt_test.py # Prompt-format ablation
+└── utils/
+    └── kv_cache_utils.py   # KV cache extraction/concatenation
+scripts/                    # Entry points
+├── train.py                # Main Q-Former training
+├── train_reconstruction.py # Reconstruction pretraining
+├── absorber_train.py       # Absorber LoRA training
+└── inspect_gates.py        # Gate inspection utility
+slurms/                     # SLURM job scripts
+docs/                       # Reference materials
+```
+
 ## Commands
 
 ```bash
@@ -16,21 +49,21 @@ LeeFRAG is a KV cache compression training pipeline for RAG (Retrieval-Augmented
 pip install -e .
 
 # Train Q-Former compressor
-python train.py --use_wandb --gradient_checkpoint_llm
+python scripts/train.py --use_wandb --gradient_checkpoint_llm
 
 # Train with custom settings
-python train.py --learning_rate 1e-4 --num_epochs 4 --batch_size 1 --kl_weight 1.0 --cross_attn_mode global
+python scripts/train.py --learning_rate 1e-4 --num_epochs 4 --batch_size 1 --kl_weight 1.0 --cross_attn_mode global
 
 # Resume from checkpoint
-python train.py --resume_from outputs/checkpoint-500/checkpoint.pt
+python scripts/train.py --resume_from outputs/checkpoint-500/checkpoint.pt
 
-# Run baseline evaluation (full-context, no compression)
-python test.py
+# Reconstruction pretraining
+python scripts/train_reconstruction.py --gradient_checkpoint_llm
 ```
 
 ## Architecture
 
-### Two-Stage Training (trainer.py)
+### Two-Stage Training (leefrag/training/trainer.py)
 
 The core training loop in `TwoStageTrainer` splits each step into two stages:
 
@@ -40,7 +73,7 @@ The core training loop in `TwoStageTrainer` splits each step into two stages:
 
 Only Q-Former parameters are trained. Gradients flow through the compressed KV cache back into the Q-Former.
 
-### Q-Former (qformer.py)
+### Q-Former (leefrag/model/qformer.py)
 
 `QFormerKVCompressor` contains 8 Q-Former layers, each responsible for a group of 4 LLM layers (8 × 4 = 32 total). Each layer:
 1. Self-attention among learned query tokens
@@ -52,11 +85,11 @@ Query count is dynamic: `doc_len // compression_ratio` (max 512). Sinusoidal pos
 
 Cross-attention modes: `global` (all queries attend to all inputs) or `windowed` (local attention windows).
 
-### Compression Schedule (scheduler.py)
+### Compression Schedule (leefrag/training/scheduler.py)
 
 Training progresses through increasing compression ratios: `[2, 4, 8, 16]`, each getting equal training steps.
 
-### Attention Masks (block_attention.py)
+### Attention Masks (leefrag/model/block_attention.py)
 
 Three mask types:
 - `build_block_causal_mask`: Block-diagonal causal for isolated documents
@@ -65,10 +98,10 @@ Three mask types:
 
 ### Data Pipeline
 
-- `dataset.py`: `RAGDataset` parses `Document:N` formatted text, tokenizes docs individually with per-doc (1024) and total (4096) token limits
-- `collator.py`: `RAGCollator` builds Stage B input using Tulu 3 chat template. Labels mask everything except answer tokens (-100)
+- `leefrag/data/dataset.py`: `RAGDataset` parses `Document:N` formatted text, tokenizes docs individually with per-doc (1024) and total (4096) token limits
+- `leefrag/data/collator.py`: `RAGCollator` builds Stage B input using Tulu 3 chat template. Labels mask everything except answer tokens (-100)
 
-### KV Cache Utilities (kv_cache_utils.py)
+### KV Cache Utilities (leefrag/utils/kv_cache_utils.py)
 
 - `extract_doc_hidden_states`: Slices per-document hidden states from concatenated forward pass output (skips embedding layer, uses layer outputs 1..N)
 - `concat_compressed_caches`: Concatenates per-document compressed KV pairs into a single `DynamicCache` along the sequence dimension

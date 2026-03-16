@@ -19,15 +19,15 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.cache_utils import DynamicCache
 
-from block_attention import (
+from leefrag.model.block_attention import (
     build_block_causal_mask,
     build_block_causal_mask_with_qa,
     build_prefix_causal_mask,
 )
-from collator import RAGCollator
-from config import ModelConfig, TrainingConfig
-from dataset import create_dataset
-from kv_cache_utils import build_dynamic_cache
+from leefrag.data.collator import RAGCollator
+from leefrag.config import ModelConfig, TrainingConfig
+from leefrag.data.dataset import create_dataset
+from leefrag.utils.kv_cache_utils import build_dynamic_cache
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)

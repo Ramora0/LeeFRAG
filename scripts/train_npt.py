@@ -1,4 +1,13 @@
-"""Main training entry point for KV cache compression with Q-Former."""
+"""Next-token prediction pretraining entry point for Q-Former KV compressor.
+
+Trains the Q-Former to compress document KV caches such that a frozen LLM
+can predict continuation text from the compressed prefix. All continuation
+tokens are supervised (unlike RAG training which only supervises answers).
+
+This is the recommended pretraining stage before RAG fine-tuning:
+    1. python scripts/train_npt.py --gradient_checkpoint_llm   (pretrain)
+    2. python scripts/train.py --init_qformer_from outputs_npt/checkpoint-*/checkpoint.pt  (finetune)
+"""
 
 import argparse
 import logging
@@ -11,10 +20,10 @@ from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from leefrag.config import ModelConfig, QFormerConfig, TrainingConfig
-from leefrag.data.collator import RAGCollator
 from leefrag.data.dataset import create_dataset
+from leefrag.data.npt_collator import NPTCollator
 from leefrag.model.qformer import QFormerKVCompressor
-from leefrag.training.trainer import TwoStageTrainer
+from leefrag.training.npt_trainer import NPTTrainer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -28,11 +37,44 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
+def detect_model_config(model, model_name: str) -> ModelConfig:
+    """Auto-detect architecture dimensions from a loaded HuggingFace model."""
+    cfg = model.config
+    num_layers = cfg.num_hidden_layers
+    hidden_size = cfg.hidden_size
+    num_kv_heads = cfg.num_key_value_heads
+    head_dim = getattr(cfg, "head_dim", hidden_size // cfg.num_attention_heads)
+    logger.info(
+        f"Detected architecture: {num_layers} layers, "
+        f"hidden={hidden_size}, kv_heads={num_kv_heads}, head_dim={head_dim}"
+    )
+    return ModelConfig(
+        model_name=model_name,
+        num_layers=num_layers,
+        hidden_size=hidden_size,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+    )
+
+
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train Q-Former KV cache compressor")
-    parser.add_argument("--dataset", type=str, default="hotpotqa", choices=["rag_v1", "hotpotqa"],
-                        help="Dataset to train on (default: hotpotqa)")
-    parser.add_argument("--output_dir", type=str, default="outputs")
+    parser = argparse.ArgumentParser(description="NPT pretraining for Q-Former KV compressor")
+    parser.add_argument("--model_name", type=str, default=ModelConfig.model_name,
+                        help="HuggingFace model name or path (default: Tulu3-Block-FT 8B)")
+    parser.add_argument("--dataset", type=str, default="slimpajama",
+                        choices=["rag_v1", "hotpotqa", "slimpajama"],
+                        help="Dataset to train on (default: slimpajama)")
+    parser.add_argument("--sources", type=str, nargs="+", default=["book", "arxiv"],
+                        choices=["book", "arxiv", "wikipedia", "c4", "commoncrawl",
+                                 "stackexchange", "github"],
+                        help="SlimPajama source domains (default: book arxiv)")
+    parser.add_argument("--max_samples", type=int, default=0,
+                        help="Max dataset samples, 0=no limit (default: 0)")
+    parser.add_argument("--max_continuation_tokens", type=int, default=1024,
+                        help="Max continuation tokens for general text (default: 1024)")
+    parser.add_argument("--min_chars", type=int, default=4000,
+                        help="Min character length to include a text (default: 4000)")
+    parser.add_argument("--output_dir", type=str, default="outputs_npt")
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--num_epochs", type=int, default=4)
     parser.add_argument("--batch_size", type=int, default=1)
@@ -44,40 +86,36 @@ def parse_args():
     parser.add_argument("--gradient_checkpoint_llm", action="store_true")
     parser.add_argument("--offload_stage_a_to_cpu", action="store_true")
     parser.add_argument("--ce_only", action="store_true",
-                        help="Train with CE loss only, no KL or hidden state loss")
+                        help="Train with CE loss only, no KL divergence")
     parser.add_argument("--kl_weight", type=float, default=1.0, help="Weight for KL divergence loss")
     parser.add_argument("--kl_top_k", type=int, default=0, help="Top-k logits for KL (0=full vocab)")
-    parser.add_argument("--hidden_state_loss", action=argparse.BooleanOptionalAction, default=True,
-                        help="Use hidden state matching instead of KL divergence")
-    parser.add_argument("--hidden_state_weight", type=float, default=10.0,
-                        help="Weight for hidden state matching loss")
-    parser.add_argument("--hidden_state_layers", type=str, default="all",
-                        help="Which layers to match: 'all' or 'last_N' (e.g. 'last_8')")
     parser.add_argument("--resume_from", type=str, default=None, help="Path to checkpoint to resume from")
     parser.add_argument("--compression_schedule", type=int, nargs="+", default=[2, 4, 8, 16],
                         help="Compression ratio schedule (default: 2 4 8 16)")
     parser.add_argument("--cross_attn_mode", type=str, default="global", choices=["global", "chunked"],
-                        help="Cross-attention mode: 'global' (pooled queries attend all) or 'chunked' (one query per chunk)")
+                        help="Cross-attention mode: 'global' or 'chunked'")
     parser.add_argument("--scale", type=int, default=1,
                         help="Scale factor for Q-Former attn_dim and ffn_dim (default: 1)")
     parser.add_argument("--layer_adapter_rank", type=int, default=0,
-                        help="Per-layer low-rank adapter rank (0=disabled, try 8)")
-    parser.add_argument("--lora", action="store_true",
-                        help="Train the LLM with LoRA adapters alongside Q-Former")
-    parser.add_argument("--lora_rank", type=int, default=16, help="LoRA rank (default: 16)")
-    parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha (default: 32)")
-    parser.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout (default: 0.05)")
-    parser.add_argument("--lora_target_modules", type=str, nargs="+", default=["q_proj", "v_proj"],
-                        help="LLM modules to apply LoRA to (default: q_proj v_proj)")
-    parser.add_argument("--init_qformer_from", type=str, default=None,
-                        help="Initialize Q-Former from checkpoint (Phase 2: weights only, fresh optimizer)")
+                        help="Per-layer low-rank adapter rank (0=disabled)")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
 
-    model_config = ModelConfig()
+    # Load LLM first so we can auto-detect architecture
+    logger.info(f"Loading LLM: {args.model_name}")
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_name,
+        torch_dtype=torch.float16,
+        device_map="auto",
+    )
+    model.eval()
+    for param in model.parameters():
+        param.requires_grad = False
+
+    model_config = detect_model_config(model, args.model_name)
     training_config = TrainingConfig(
         output_dir=args.output_dir,
         learning_rate=args.learning_rate,
@@ -93,15 +131,7 @@ def main():
         ce_only_loss=args.ce_only,
         kl_weight=args.kl_weight,
         kl_top_k=args.kl_top_k,
-        hidden_state_loss=args.hidden_state_loss,
-        hidden_state_weight=args.hidden_state_weight,
-        hidden_state_layers=args.hidden_state_layers,
         compression_schedule=args.compression_schedule,
-        lora=args.lora,
-        lora_rank=args.lora_rank,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        lora_target_modules=args.lora_target_modules,
     )
 
     qformer_config = QFormerConfig(
@@ -122,40 +152,13 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Load LLM
-    logger.info(f"Loading LLM: {model_config.model_name}")
-    model = AutoModelForCausalLM.from_pretrained(
-        model_config.model_name,
-        torch_dtype=torch.float16,
-        device_map="auto",
-    )
-    model.eval()
-    for param in model.parameters():
-        param.requires_grad = False
-
-    # Apply LoRA adapters if requested
-    base_model = model  # keep reference to unwrapped LlamaForCausalLM
-    if training_config.lora:
-        from peft import LoraConfig, get_peft_model
-        lora_config = LoraConfig(
-            r=training_config.lora_rank,
-            lora_alpha=training_config.lora_alpha,
-            lora_dropout=training_config.lora_dropout,
-            target_modules=training_config.lora_target_modules,
-            bias="none",
-            task_type="CAUSAL_LM",
-        )
-        model = get_peft_model(model, lora_config)
-        lora_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        logger.info(f"LoRA enabled: {lora_params / 1e6:.1f}M trainable LLM params")
-
     if training_config.gradient_checkpoint_llm:
         model.gradient_checkpointing_enable()
         logger.info("Enabled gradient checkpointing for LLM (Stage B)")
 
-    # Build Q-Former (pass unwrapped LLM so frozen KV projections are copied correctly)
+    # Build Q-Former
     logger.info("Building Q-Former KV compressor")
-    qformer = QFormerKVCompressor(qformer_config, model_config, llm=base_model).to(device)
+    qformer = QFormerKVCompressor(qformer_config, model_config, llm=model).to(device)
     if qformer_config.cross_attn_mode == "chunked":
         qformer._cross_attend_chunked = torch.compile(qformer._cross_attend_chunked, dynamic=True)
     else:
@@ -165,6 +168,14 @@ def main():
 
     # Load datasets
     logger.info(f"Loading datasets ({args.dataset})...")
+    dataset_kwargs = {}
+    if args.dataset == "slimpajama":
+        dataset_kwargs = dict(
+            sources=tuple(args.sources),
+            max_samples=args.max_samples,
+            max_continuation_tokens=args.max_continuation_tokens,
+            min_chars=args.min_chars,
+        )
     train_dataset = create_dataset(
         dataset_name=args.dataset,
         tokenizer=tokenizer,
@@ -172,6 +183,7 @@ def main():
         split="train",
         eval_split_ratio=training_config.eval_split_ratio,
         seed=training_config.seed,
+        **dataset_kwargs,
     )
     eval_dataset = create_dataset(
         dataset_name=args.dataset,
@@ -180,10 +192,11 @@ def main():
         split="eval",
         eval_split_ratio=training_config.eval_split_ratio,
         seed=training_config.seed,
+        **dataset_kwargs,
     )
     logger.info(f"Train: {len(train_dataset)} samples, Eval: {len(eval_dataset)} samples")
 
-    collator = RAGCollator(tokenizer)
+    collator = NPTCollator(tokenizer)
     train_loader = DataLoader(
         train_dataset,
         batch_size=training_config.batch_size,
@@ -202,7 +215,7 @@ def main():
     )
 
     # Build trainer
-    trainer = TwoStageTrainer(
+    trainer = NPTTrainer(
         model=model,
         qformer=qformer,
         tokenizer=tokenizer,
@@ -213,13 +226,6 @@ def main():
         device=device,
     )
 
-    # Initialize Q-Former from pretrained checkpoint (Phase 2: weights only, fresh optimizer)
-    if args.init_qformer_from:
-        logger.info(f"Initializing Q-Former from: {args.init_qformer_from}")
-        ckpt = torch.load(args.init_qformer_from, map_location=device, weights_only=True)
-        qformer.load_state_dict(ckpt["qformer_state_dict"])
-        logger.info(f"Loaded Q-Former weights from step {ckpt.get('step', '?')} (fresh optimizer)")
-
     # Resume from checkpoint
     if args.resume_from:
         logger.info(f"Resuming from checkpoint: {args.resume_from}")
@@ -228,14 +234,10 @@ def main():
         trainer.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         if "scaler_state_dict" in ckpt:
             trainer.scaler.load_state_dict(ckpt["scaler_state_dict"])
-        if training_config.lora and "lora_state_dict" in ckpt:
-            from peft import set_peft_model_state_dict
-            set_peft_model_state_dict(model, ckpt["lora_state_dict"])
-            logger.info("Restored LoRA adapter weights from checkpoint")
         logger.info(f"Resumed from step {ckpt.get('step', '?')}")
 
     # Train
-    logger.info("Starting training...")
+    logger.info("Starting NPT pretraining...")
     trainer.train()
 
     logger.info("Done!")

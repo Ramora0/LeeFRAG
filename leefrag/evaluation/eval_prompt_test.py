@@ -20,9 +20,9 @@ import torch.nn.functional as F
 from datasets import load_dataset
 from tqdm import tqdm
 
-from collator import RAGCollator
-from config import ModelConfig, QFormerConfig
-from eval import (
+from leefrag.data.collator import RAGCollator
+from leefrag.config import ModelConfig, QFormerConfig
+from leefrag.evaluation.eval import (
     compute_ce_loss,
     compress_docs,
     load_checkpoint,

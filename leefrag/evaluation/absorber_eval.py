@@ -23,8 +23,8 @@ import torch.nn.functional as F
 from tqdm import tqdm
 from transformers.cache_utils import DynamicCache
 
-from config import ModelConfig
-from eval import (
+from leefrag.config import ModelConfig
+from leefrag.evaluation.eval import (
     SYSTEM_PROMPT,
     best_subspan_em,
     compute_ce_loss,
@@ -39,7 +39,7 @@ from eval import (
     load_model,
     prep_hotpotqa_sample,
 )
-from kv_cache_utils import _rotate_half, apply_rope_to_cache, build_dynamic_cache
+from leefrag.utils.kv_cache_utils import _rotate_half, apply_rope_to_cache, build_dynamic_cache
 
 import logging
 

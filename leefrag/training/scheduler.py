@@ -1,4 +1,4 @@
-from config import TrainingConfig
+from leefrag.config import TrainingConfig
 
 
 class CompressionScheduler:

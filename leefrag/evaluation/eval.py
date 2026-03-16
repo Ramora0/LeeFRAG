@@ -27,16 +27,16 @@ from datasets import load_dataset
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from block_attention import build_block_causal_mask_with_qa
-from collator import RAGCollator
-from config import ModelConfig, QFormerConfig, TrainingConfig
-from dataset import RAGDataset
-from kv_cache_utils import (
+from leefrag.model.block_attention import build_block_causal_mask_with_qa
+from leefrag.data.collator import RAGCollator
+from leefrag.config import ModelConfig, QFormerConfig, TrainingConfig
+from leefrag.data.dataset import RAGDataset
+from leefrag.utils.kv_cache_utils import (
     apply_rope_to_cache,
     concat_compressed_caches,
     extract_doc_hidden_states,
 )
-from qformer import QFormerKVCompressor
+from leefrag.model.qformer import QFormerKVCompressor
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"

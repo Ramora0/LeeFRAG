@@ -14,11 +14,11 @@ import torch
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from config import ModelConfig, QFormerConfig, TrainingConfig
-from dataset import create_dataset
-from qformer import QFormerKVCompressor
-from reconstruction_collator import ReconstructionCollator
-from reconstruction_trainer import ReconstructionTrainer
+from leefrag.config import ModelConfig, QFormerConfig, TrainingConfig
+from leefrag.data.dataset import create_dataset
+from leefrag.model.qformer import QFormerKVCompressor
+from leefrag.data.reconstruction_collator import ReconstructionCollator
+from leefrag.training.reconstruction_trainer import ReconstructionTrainer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)

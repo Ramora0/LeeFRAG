@@ -20,11 +20,11 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import PreTrainedTokenizer
 
-from absorber_eval import build_absorber_mask, unapply_rope
-from block_attention import build_block_causal_mask, build_block_causal_mask_with_qa, build_prefix_causal_mask
-from config import ModelConfig, TrainingConfig
-from kv_cache_utils import _rotate_half, apply_rope_to_cache, build_dynamic_cache
-from scheduler import CompressionScheduler
+from leefrag.evaluation.absorber_eval import build_absorber_mask, unapply_rope
+from leefrag.model.block_attention import build_block_causal_mask, build_block_causal_mask_with_qa, build_prefix_causal_mask
+from leefrag.config import ModelConfig, TrainingConfig
+from leefrag.utils.kv_cache_utils import _rotate_half, apply_rope_to_cache, build_dynamic_cache
+from leefrag.training.scheduler import CompressionScheduler
 
 logger = logging.getLogger(__name__)
 

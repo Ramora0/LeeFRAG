@@ -45,7 +45,7 @@ echo "Starting training..."
 echo "Args: $EXTRA_ARGS"
 echo "================================================"
 
-python train.py --gradient_checkpoint_llm $EXTRA_ARGS
+python scripts/train.py --gradient_checkpoint_llm $EXTRA_ARGS
 
 echo "================================================"
 echo "Training complete. Cleaning up..."

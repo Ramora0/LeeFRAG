@@ -15,8 +15,8 @@ set -euo pipefail
 
 # CLI arguments
 # Usage: sbatch slurms/a100.slurm <script> <branch> [extra args...]
-# Example: sbatch slurms/a100.slurm train.py main --num_epochs 2
-# Example: sbatch slurms/a100.slurm train_reconstruction.py reconstruction --bypass
+# Example: sbatch slurms/a100.slurm scripts/train.py main --num_epochs 2
+# Example: sbatch slurms/a100.slurm scripts/train_reconstruction.py reconstruction --bypass
 SCRIPT="${1:?Usage: sbatch slurms/a100.slurm <script> <branch> [extra args...]}"
 shift
 BRANCH="${1:-main}"

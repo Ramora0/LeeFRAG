@@ -8,16 +8,16 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, PreTrainedTokenizer
 
-from config import ModelConfig, QFormerConfig, TrainingConfig
-from block_attention import build_block_causal_mask, build_block_prefix_causal_mask
-from kv_cache_utils import (
+from leefrag.config import ModelConfig, QFormerConfig, TrainingConfig
+from leefrag.model.block_attention import build_block_causal_mask, build_block_prefix_causal_mask
+from leefrag.utils.kv_cache_utils import (
     apply_rope_to_cache_blocked,
     build_blocked_position_ids,
     concat_compressed_caches,
     extract_doc_hidden_states,
 )
-from qformer import QFormerKVCompressor
-from scheduler import CompressionScheduler
+from leefrag.model.qformer import QFormerKVCompressor
+from leefrag.training.scheduler import CompressionScheduler
 
 logger = logging.getLogger(__name__)
 

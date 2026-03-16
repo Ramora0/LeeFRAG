@@ -10,10 +10,10 @@ import torch
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from config import ModelConfig, TrainingConfig
-from collator import RAGCollator
-from dataset import create_dataset
-from absorber_trainer import AbsorberLoRATrainer
+from leefrag.config import ModelConfig, TrainingConfig
+from leefrag.data.collator import RAGCollator
+from leefrag.data.dataset import create_dataset
+from leefrag.training.absorber_trainer import AbsorberLoRATrainer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
