@@ -67,6 +67,8 @@ def parse_args():
     # Dataset
     parser.add_argument("--dataset", type=str, default="slimpajama",
                         choices=["rag_v1", "hotpotqa", "slimpajama"])
+    parser.add_argument("--max_samples", type=int, default=0,
+                        help="Max dataset samples before split (0 = unlimited)")
     parser.add_argument("--eval_samples", type=int, default=200,
                         help="Max eval samples (0 = use full eval set)")
 
@@ -199,6 +201,7 @@ def main():
         split="train",
         eval_split_ratio=training_config.eval_split_ratio,
         seed=training_config.seed,
+        max_samples=args.max_samples,
     )
     eval_dataset = create_dataset(
         dataset_name=args.dataset,
@@ -207,6 +210,7 @@ def main():
         split="eval",
         eval_split_ratio=training_config.eval_split_ratio,
         seed=training_config.seed,
+        max_samples=args.max_samples,
     )
     logger.info(f"Train: {len(train_dataset)} samples, Eval: {len(eval_dataset)} samples")
 

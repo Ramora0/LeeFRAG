@@ -286,15 +286,19 @@ class GeneralTextDataset(Dataset):
 
         # Tokenize all documents upfront and chunk into fixed-size windows
         window = model_config.max_total_doc_tokens + max_continuation_tokens
+        all_texts = [raw_data[i]["text"] for i in range(len(raw_data))]
+        all_token_ids = tokenizer(
+            all_texts, add_special_tokens=False,
+        )["input_ids"]
+        del all_texts
+
         self.chunks = []  # list of token id lists, one per chunk
-        for doc_idx in range(len(raw_data)):
-            token_ids = tokenizer.encode(
-                raw_data[doc_idx]["text"], add_special_tokens=False,
-            )
+        for token_ids in all_token_ids:
             if len(token_ids) < 256:
                 continue
             for start in range(0, len(token_ids) - 256, window):
                 self.chunks.append(token_ids[start : start + window])
+        del all_token_ids
 
         logger.info(
             f"GeneralTextDataset ({split}): {len(raw_data)} docs → "
