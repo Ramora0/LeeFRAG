@@ -65,9 +65,17 @@ HF_HOME=/fs/scratch/PAS2836/lees_stuff/hf_cache ../.a100/bin/python ../scripts/t
 
 **Focus on architecture, not hyperparameters.** Your primary job is to explore structural changes to the Q-Former and the training pipeline — layer design, attention mechanisms, projection strategies, cross-attention patterns, positional encodings, etc. Do not spend time tuning learning rates, weight decay, or other hyperparameters unless you have strong reason to believe they are essential to making a specific architectural change work, or you are genuinely uncertain whether a poor result is due to the architecture or a bad hyperparameter fit.
 
+**Think before you hack:**
+- Before experimenting, identify and test the core assumptions of the current architecture.
+- When something isn't working, simplify toward first principles rather than adding complexity.
+- Question the fundamental structure, not just the components.
+- Run diagnostics before modifications.
+
 Since we want quick iteration for architecture experimentation, use `meta-llama/Llama-3.2-1B` (default). Fast iteration, ~5 min per experiment.
 
 **Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude. A tiny eval_ce_loss improvement that adds 20 lines of hacky code? Probably not worth it. A tiny improvement from deleting code? Definitely keep. An improvement of ~0 but much simpler code? Keep.
+
+**Start big, shrink later**: When trying a new architectural idea, default to more parameters/capacity first. We can always reduce size later to see if a smaller version still works, but we don't want to discard a good idea because it was tested at too small a scale.
 
 **VRAM** is a soft constraint. Some increase is acceptable for meaningful eval_ce_loss gains, but it should not blow up dramatically.
 
@@ -114,30 +122,43 @@ qformer_params_M:   3.7
 
 Primary metric is `eval_ce_loss` (lower is better). This is CE loss on all continuation tokens at the final compression ratio.
 
+## Git
+
+Since your working directory is `autoresearch/`, use `git -C ..` for all git commands. Do NOT use `cd .. && git ...` — it will be blocked by the sandbox:
+
+```bash
+git -C .. status
+git -C .. add -A && git -C .. commit -m "message"
+git -C .. reset --hard HEAD~1
+git -C .. log --oneline -5
+```
+
 ## The Experiment Loop
+
+Only run **one experiment at a time** — do not launch multiple runs in parallel.
 
 LOOP FOREVER:
 
-1. Look at the git state: the current branch/commit you're on.
+1. Check git state: `git -C .. log --oneline -3`
 2. Modify editable files with an experimental idea — a single, focused change.
-3. `git commit` — commit message should be a brief hypothesis: what you changed and why you think it will help (e.g. "add residual in cross-attn: gradient flow to early queries is weak").
-4. Run the experiment:
+3. Commit: `git -C .. add -A && git -C .. commit -m "brief hypothesis"` — e.g. "add residual in cross-attn: gradient flow to early queries is weak".
+4. Run the experiment with `run_in_background`. Do NOT call `TaskOutput` to wait for it — you will be automatically notified when it completes. While waiting, you can plan your next experiment or respond to the user:
    ```bash
    HF_HOME=/fs/scratch/PAS2836/lees_stuff/hf_cache ../.a100/bin/python ../scripts/train_npt_timed.py --no_wandb
    ```
-5. Read the results from the output. The script prints a machine-readable summary at the end.
+5. When the run finishes, read the results from the output. The script prints a machine-readable summary at the end.
 6. If the run crashed, read the error from the output.
    - If it's something dumb (typo, missing import): fix and re-run.
    - If the idea is fundamentally broken: log as crash and move on.
-7. Record the results in `autoresearch/results.tsv` (do NOT commit this file).
+7. Record the results in `results.tsv` (do NOT commit this file).
 8. If eval_ce_loss improved (lower), keep the change — advance the branch.
-9. If eval_ce_loss is equal or worse, `git reset --hard` back to where you started.
+9. If eval_ce_loss is equal or worse, revert: `git -C .. reset --hard HEAD~1`.
 
 **GPU switching**: Results are only comparable on the same GPU. If you're on a different GPU than the current best result was run on, re-run the current code first to establish a comparable baseline before making changes.
 
 **Timeout**: Each experiment should take ~5 minutes (+ startup/eval overhead). If a run exceeds 10 minutes, kill it and treat as failure (discard and revert).
 
-**Running out of ideas**: If you feel stuck, think harder — re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. Do not fall back to hyperparameter tuning as a crutch.
+**Escalate when stuck**: If you've had several discards in a row, your changes are probably too incremental. Step back, review `results.tsv` for patterns, and try bigger, more radical architectural changes. Check `ideas.md` for inspiration. Re-read the in-scope files for new angles, try combining previous near-misses. Do not fall back to hyperparameter tuning as a crutch.
 
 **NEVER STOP**: Once the experiment loop has begun, do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep or away and expects you to continue working *indefinitely* until manually stopped. You are autonomous. The loop runs until the human interrupts you, period.
 
