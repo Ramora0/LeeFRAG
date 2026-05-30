@@ -20,10 +20,12 @@ Each LLaMA layer's attention is **monkeypatched** (`model/patch.py`) into two pa
 
 The gate is a **Gumbel-sigmoid straight-through** sample (`model/selector.py`);
 noise is pre-sampled into the forward context so gradient-checkpoint recompute
-replays it. The **budget loss** (`training/budget.py`) is computed on captured,
-detached chunk hidden states so it stays correct under checkpointing and trains
-only the selector. Positions are **contiguous** (HF default). The KL anchor uses
-an **offline precomputed teacher** (`scripts/precompute_teacher.py`).
+replays it. The **budget loss** (`training/budget.py`) is a binomial NLL of the
+sampled keep-count K against the prior rate π (`-log Binom(K; D, π)`, minimized at
+K=Dπ); it re-samples the selector on captured, detached chunk hidden states with
+the same stored noise, so it stays correct under checkpointing and trains only
+the selector. Positions are **contiguous** (HF default). The KL anchor uses an
+**offline precomputed teacher** (`scripts/precompute_teacher.py`).
 
 ## Layout
 

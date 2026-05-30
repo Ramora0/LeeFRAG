@@ -19,7 +19,7 @@ from leefrag_v2.config import SelectorConfig, V2ModelConfig, V2TrainingConfig
 from leefrag_v2.data.adapter import build_blocks
 from leefrag_v2.model.patch import new_context, sample_step_noise, set_context
 from leefrag_v2.model.peft_setup import collect_param_groups
-from leefrag_v2.training.budget import KeepRateScheduler, budget_kl_loss
+from leefrag_v2.training.budget import KeepRateScheduler, budget_binomial_loss
 from leefrag_v2.training.losses import ce_on_answer, kl_to_teacher
 
 logger = logging.getLogger(__name__)
@@ -165,8 +165,9 @@ class V2Trainer:
         metrics = {"ce": ce.item(), "pi": pi, "tau": tau, "budget": 0.0, "keep": 0.0, "kl": 0.0}
 
         if self.mode == "learned":
-            budget, keep = budget_kl_loss(
-                ctx.captured_chunk_hidden, self.selector, pi, self.device
+            budget, keep = budget_binomial_loss(
+                ctx.captured_chunk_hidden, self.selector, pi, tau, ctx.noise,
+                self.device, hard=self.cfg.budget_hard_count,
             )
             loss = loss + self.cfg.budget_weight * budget
             metrics["budget"] = budget.item()

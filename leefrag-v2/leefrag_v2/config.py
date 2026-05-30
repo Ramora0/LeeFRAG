@@ -97,9 +97,9 @@ class V2TrainingConfig:
     # Keep-rate (compression) schedule: pi = fraction kept. 0.5/0.25/0.125 = 2x/4x/8x.
     keep_rate_schedule: list[float] = field(default_factory=lambda: [0.5, 0.25, 0.125])
 
-    # Budget loss: per-token KL(Bernoulli(p) || Bernoulli(pi)), weighted.
+    # Budget loss: binomial NLL of the sampled keep-count vs prior rate pi.
     budget_weight: float = 0.1
-    budget_anneal: bool = True
+    budget_hard_count: bool = True  # count hard STE samples (else soft concrete)
     entropy_weight: float = 0.0
     load_balance_weight: float = 0.0
 

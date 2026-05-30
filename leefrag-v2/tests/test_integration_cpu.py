@@ -15,7 +15,7 @@ from leefrag_v2.model.patch import (
     set_context,
 )
 from leefrag_v2.model.selector import LayerSelector
-from leefrag_v2.training.budget import budget_kl_loss
+from leefrag_v2.training.budget import budget_binomial_loss
 from leefrag_v2.training.losses import ce_on_answer
 
 
@@ -57,7 +57,9 @@ def test_full_forward_backward_cpu():
     assert out.logits.shape == (1, S, cfg.vocab_size)
 
     ce = ce_on_answer(out.logits, labels)
-    budget, keep = budget_kl_loss(ctx.captured_chunk_hidden, selector, 0.25, "cpu")
+    budget, keep = budget_binomial_loss(
+        ctx.captured_chunk_hidden, selector, 0.25, 1.0, ctx.noise, "cpu"
+    )
     loss = ce + 0.1 * budget
     assert torch.isfinite(loss)
     loss.backward()
