@@ -1,0 +1,28 @@
+[project]
+name = "leefrag-v2"
+version = "0.1.0"
+description = "Per-layer differentiable KV selection for RAG compression (block-causal chunks + learned gate)"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.6.0",
+    "transformers>=5.0.0",
+    "datasets>=2.18.0",
+    "accelerate>=0.28.0",
+    "safetensors>=0.4.0",
+    "sentencepiece>=0.2.0",
+    "protobuf>=4.25.0",
+    "tqdm>=4.66.0",
+    "wandb>=0.16.0",
+    "peft>=0.13.0",
+]
+
+# Reuses the data pipeline from the sibling `leefrag` package (same venv). Install both editable:
+#   uv pip install -e .            # (repo root, installs leefrag)
+#   uv pip install -e leefrag-v2   # installs leefrag_v2
+
+[tool.setuptools.packages.find]
+include = ["leefrag_v2*"]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
