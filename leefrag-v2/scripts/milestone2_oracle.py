@@ -38,6 +38,9 @@ def main():
         mode="oracle", use_kl_teacher=False, num_epochs=args.epochs,
         dataset_name=args.dataset, learning_rate=args.learning_rate,
         output_dir=args.output_dir, use_flex=not args.no_flex, use_wandb=not args.no_wandb,
+        # Oracle measures a quality ceiling at a FIXED compression, so it uses the
+        # discrete-phase schedule (constant pi), not the DMS cr_linear ramp.
+        keep_rate_mode="phases",
     )
     if args.keep_rate is not None:
         cfg.keep_rate_schedule = [args.keep_rate]

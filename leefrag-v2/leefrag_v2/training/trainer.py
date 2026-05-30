@@ -80,9 +80,14 @@ class V2Trainer:
             mode=training_config.keep_rate_mode,
             pi_min=training_config.keep_rate_min,
             pi_max=training_config.keep_rate_max,
+            cr_steps_per_unit=training_config.cr_steps_per_unit,
         )
         if training_config.eval_steps is None:
-            training_config.eval_steps = max(1, self.keep_rate_scheduler.steps_per_phase // 4)
+            # phased: ~4 evals per CR phase; continuous ramp: ~16 evals over the run.
+            if self.keep_rate_scheduler.is_phased:
+                training_config.eval_steps = max(1, self.keep_rate_scheduler.steps_per_phase // 4)
+            else:
+                training_config.eval_steps = max(1, self.total_steps // 16)
 
         groups = collect_param_groups(model, selector, training_config)
         for g in groups:
@@ -90,7 +95,14 @@ class V2Trainer:
         self.optimizer = torch.optim.AdamW(
             groups, betas=(training_config.adam_beta1, training_config.adam_beta2)
         )
-        self.scaler = torch.amp.GradScaler("cuda", enabled=training_config.fp16)
+        # bf16 needs no loss scaling; only fp16 does. autocast runs the frozen
+        # base in low precision while the fp32 trainable params accumulate grads
+        # in fp32 (loader keeps them fp32). A disabled GradScaler is a pass-through.
+        self.amp_dtype = torch.bfloat16 if training_config.bf16 else torch.float16
+        self.use_amp = training_config.bf16 or training_config.fp16
+        self.scaler = torch.amp.GradScaler(
+            "cuda", enabled=training_config.fp16 and not training_config.bf16
+        )
 
         if training_config.gradient_checkpointing:
             if hasattr(model, "enable_input_require_grads"):
@@ -122,14 +134,21 @@ class V2Trainer:
         )
 
     def _update_lr(self, step: int) -> float:
-        spp = self.keep_rate_scheduler.steps_per_phase
-        phase = self.keep_rate_scheduler.get_phase(step)
-        phase_step = step - phase * spp
-        warmup = int(spp * self.cfg.warmup_ratio)
-        if phase_step < warmup:
-            scale = phase_step / max(1, warmup)
+        # Discrete phases warmup + cosine-restart at each CR jump; a continuous CR
+        # ramp (DMS cr_linear / linear / sampled_range) gets a single warmup +
+        # cosine decay over the whole run (no restarts -- there are no phases).
+        if self.keep_rate_scheduler.is_phased:
+            period = self.keep_rate_scheduler.steps_per_phase
+            phase = self.keep_rate_scheduler.get_phase(step)
+            local = step - phase * period
         else:
-            prog = (phase_step - warmup) / max(1, spp - warmup)
+            period = self.total_steps
+            local = step
+        warmup = int(period * self.cfg.warmup_ratio)
+        if local < warmup:
+            scale = local / max(1, warmup)
+        else:
+            prog = (local - warmup) / max(1, period - warmup)
             scale = 0.5 * (1.0 + math.cos(math.pi * prog))
         for g in self.optimizer.param_groups:
             g["lr"] = g["initial_lr"] * scale
@@ -181,7 +200,7 @@ class V2Trainer:
             )
         set_context(self.model, ctx)
 
-        with torch.amp.autocast("cuda", enabled=self.cfg.fp16):
+        with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
             out = self.model(input_ids=blocks["input_ids"], use_cache=False)
             logits = out.logits
             ce = ce_on_answer(logits, blocks["labels"])
@@ -306,7 +325,7 @@ class V2Trainer:
                     gate_renorm=self.sc.gate_renorm,
                 )
             set_context(self.model, ctx)
-            with torch.amp.autocast("cuda", enabled=self.cfg.fp16):
+            with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
                 out = self.model(input_ids=blocks["input_ids"], use_cache=False)
                 ce = ce_on_answer(out.logits, blocks["labels"])
             set_context(self.model, None)

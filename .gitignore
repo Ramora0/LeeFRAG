@@ -4,6 +4,6 @@
 __pycache__/
 *.egg-info/
 outputs/
-docs/block-attention.pdf
+docs/
 .env
 autoresearch/results.tsv

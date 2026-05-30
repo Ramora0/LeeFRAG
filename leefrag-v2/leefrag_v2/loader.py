@@ -50,6 +50,15 @@ def build_training_model(
     if training_config.train_norms:
         unfreeze_norms(model)
 
+    # Keep trainable params (DoRA adapters + unfrozen norms) in fp32 so AdamW
+    # holds fp32 master weights + moments (matching DMS's "optimizer states in
+    # FP32"); the frozen base stays in the loaded low-precision dtype. autocast
+    # casts these to the compute dtype per-op, so the bf16 forward is unaffected.
+    # (The selector is already fp32.)
+    for p in model.parameters():
+        if p.requires_grad:
+            p.data = p.data.float()
+
     selector = None
     if training_config.mode == "learned":
         selector = LayerSelector(

@@ -59,7 +59,11 @@ def _compute_gate(attn_module, ctx, hidden_states, layer_idx, D):
     per_head = logits.dim() == 3  # [1, Hkv, D] when selector.per_head else [1, D]
     if attn_module.training:
         noise = ctx.noise[layer_idx] if ctx.noise is not None else None
-        gate = gumbel_sigmoid_ste(logits, tau=ctx.tau, noise=noise, hard=True, training=True)
+        # Soft (relaxed) gate by default -- DMS uses the continuous alpha directly;
+        # hard=True is the straight-through ablation. With gate_renorm the soft
+        # gate equals DMS's additive log(alpha) mask.
+        hard = bool(getattr(ctx.selector.cfg, "train_gate_hard", False))
+        gate = gumbel_sigmoid_ste(logits, tau=ctx.tau, noise=noise, hard=hard, training=True)
     elif ctx.eval_pi is not None:
         if per_head:
             mode = getattr(ctx.selector.cfg, "per_head_eval", "equal")
