@@ -53,7 +53,8 @@ def build_training_model(
     selector = None
     if training_config.mode == "learned":
         selector = LayerSelector(
-            selector_config, model_config.num_layers, model_config.hidden_size
+            selector_config, model_config.num_layers, model_config.hidden_size,
+            num_kv_heads=model_config.num_kv_heads,
         ).to(device)
 
     install_gated_attention(model)

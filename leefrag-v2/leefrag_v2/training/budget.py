@@ -14,21 +14,47 @@ penalized count matches the gate that was actually applied in attention.
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 from leefrag_v2.model.selector import gumbel_sigmoid_ste
 
 
 class KeepRateScheduler:
-    """Maps a training step to the prior keep fraction pi (= 1 / compression)."""
+    """Maps a training step to the prior keep fraction pi (= 1 / compression).
 
-    def __init__(self, schedule: list[float], total_steps: int):
+    mode:
+      "phases"        - step through `schedule` (discrete CR phases; default).
+      "linear"        - anneal pi in log-space from pi_max -> pi_min over training
+                        (CR moves smoothly; one run sweeps the whole family).
+      "sampled_range" - draw pi ~ log-uniform[pi_min, pi_max] each step so the
+                        adapters generalize across CRs (eval dials pi via top-k).
+    """
+
+    def __init__(
+        self,
+        schedule: list[float],
+        total_steps: int,
+        mode: str = "phases",
+        pi_min: float = 0.125,
+        pi_max: float = 0.5,
+    ):
         assert len(schedule) > 0
         self.schedule = schedule
         self.total_steps = total_steps
+        self.mode = mode
+        self.pi_min = pi_min
+        self.pi_max = pi_max
         self.steps_per_phase = max(1, total_steps // len(schedule))
 
     def get_pi(self, step: int) -> float:
+        if self.mode == "linear":
+            t = min(1.0, step / max(1, self.total_steps - 1))
+            return math.exp(math.log(self.pi_max) * (1 - t) + math.log(self.pi_min) * t)
+        if self.mode == "sampled_range":
+            u = float(torch.rand(()).item())
+            return math.exp(math.log(self.pi_min) * (1 - u) + math.log(self.pi_max) * u)
         return self.schedule[self.get_phase(step)]
 
     def get_phase(self, step: int) -> int:
@@ -82,3 +108,43 @@ def budget_binomial_loss(
     if n == 0:
         return total, 0.0
     return total / n, mean_keep / n
+
+
+def budget_onesided_global(
+    captured_chunk_hidden: list,
+    selector,
+    pi: float,
+    tau: float,
+    noise: list | None,
+    device,
+    hard: bool = True,
+) -> tuple[torch.Tensor, float]:
+    """One-sided global budget: penalize only TOTAL kept > pi * total_slots.
+
+    Sums the sampled keep-count over every layer (and KV head, when the selector
+    is per-head), then applies a ReLU hinge on the aggregate. Because nothing
+    pins an individual layer/head/position to pi, the model is free to compress
+    unequally (DMS-style adaptive CR) as long as the total stays under budget.
+
+    Gradient reaches the selector only: it is re-applied to the captured
+    (detached) hidden states with the SAME noise as the forward pass, so the
+    penalized count matches the gate that was actually applied in attention.
+    """
+    total_kept = torch.zeros((), device=device)
+    total_slots = 0
+    for layer_idx, hidden in enumerate(captured_chunk_hidden):
+        if hidden is None:
+            continue
+        logits = selector(hidden, layer_idx)  # [1, D] or [1, Hkv, D]
+        layer_noise = noise[layer_idx] if noise is not None else None
+        g = gumbel_sigmoid_ste(
+            logits, tau=tau, noise=layer_noise, hard=hard, training=True
+        )
+        total_kept = total_kept + g.sum()
+        total_slots += g.numel()
+
+    if total_slots == 0:
+        return total_kept, 0.0
+    target = pi * total_slots
+    loss = torch.relu(total_kept - target) / total_slots
+    return loss, float(total_kept.item() / total_slots)

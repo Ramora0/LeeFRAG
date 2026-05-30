@@ -34,7 +34,8 @@ def test_full_forward_backward_cpu():
     install_gated_attention(model)
 
     selector = LayerSelector(
-        SelectorConfig(trunk_dim=32), cfg.num_hidden_layers, cfg.hidden_size
+        SelectorConfig(trunk_dim=32, per_head=False),
+        cfg.num_hidden_layers, cfg.hidden_size,
     ).float()
     selector.train()
 

@@ -40,14 +40,15 @@ class V2ModelConfig:
 
 @dataclass
 class SelectorConfig:
-    """Per-layer, query-agnostic keep-selector.
+    """Per-head, query-agnostic keep-selector.
 
     Reads each chunk token's (post-input-layernorm) hidden state at a layer and
-    emits one keep-logit. A shared trunk + per-layer head keeps params small
-    while letting each layer choose different tokens.
+    emits one keep-logit per KV head. The default arch is a simple per-layer
+    linear projection (hidden_size -> num_kv_heads) -- DMS-style: no trunk, no
+    re-projection of the hidden dim, fewest params.
     """
 
-    arch: str = "shared_trunk"  # "shared_trunk" | "independent"
+    arch: str = "linear"  # "linear" (per-layer linear probe, default) | "shared_trunk" | "independent"
     trunk_dim: int = 512
     trunk_layers: int = 1
     activation: str = "gelu"
@@ -65,14 +66,34 @@ class SelectorConfig:
 
     query_agnostic: bool = True  # asserted in the selector; never reads Q+A.
 
+    # Per-head selection: emit one keep-logit per *KV head* (num_kv_heads) per
+    # token instead of one per token for the whole layer. Granularity is per KV
+    # head (NOT per query head) so it respects GQA: a query-head group shares one
+    # physical KV cache, so all query heads in a group share the keep-set. With a
+    # global budget, KV heads may keep unequal fractions (different lengths) and
+    # only the total is constrained. Eval pools logits over (head, token) for a
+    # global top-k so the realized budget stays exact.
+    # Default ON (DMS decides eviction per head; per-head adaptive CR is a core
+    # source of its accuracy-at-budget). Requires the per-head-aware budget loss
+    # (budget_mode="onesided_global"); the binomial budget is per-layer only.
+    per_head: bool = True
+    # Per-head eval budget rule: "equal" keeps the same count (ceil(pi*D)) in
+    # every KV head -> all heads same length, exact budget, no ragged cache.
+    # "global" pools (head, token) and keeps the top pi overall -> heads keep
+    # unequal counts (adaptive CR) at the cost of ragged per-head lengths.
+    per_head_eval: str = "equal"
+
     # Oracle / frozen keep-set for milestone 2 (no learned selector).
     #   None | "random_fixed" | "teacher_topk"
     oracle_keep_set: str | None = None
     freeze_selector: bool = False
 
-    # Ablation only: renormalize Q+A attention over kept chunk keys. Default OFF
-    # per the spec ("zeroed out", not renormalized).
-    gate_renorm: bool = False
+    # Renormalize Q+A attention over kept chunk keys after gating. With a hard
+    # gate this makes post-softmax gating identical to pre-softmax masking, i.e.
+    # softmax over (kept chunk keys + Q+A) -- exactly what real KV eviction does
+    # at inference. ON by default so train == eval == deploy. (False = legacy
+    # "zeroed out, not renormalized", kept only for ablation.)
+    gate_renorm: bool = True
 
 
 @dataclass
@@ -95,17 +116,34 @@ class V2TrainingConfig:
     fp16: bool = True
 
     # Keep-rate (compression) schedule: pi = fraction kept. 0.5/0.25/0.125 = 2x/4x/8x.
+    # mode: "phases" steps through keep_rate_schedule; "linear" anneals pi in
+    # log-space from keep_rate_max -> keep_rate_min over training; "sampled_range"
+    # draws pi ~ log-uniform[keep_rate_min, keep_rate_max] each step so one run
+    # yields adapters robust across the whole CR family (eval dials pi via topk).
+    keep_rate_mode: str = "phases"
     keep_rate_schedule: list[float] = field(default_factory=lambda: [0.5, 0.25, 0.125])
+    keep_rate_min: float = 0.125
+    keep_rate_max: float = 0.5
+    # Eval sweeps these keep fractions (a "family of models" from one checkpoint).
+    eval_pis: list[float] = field(default_factory=lambda: [0.5, 0.25, 0.125])
 
-    # Budget loss: binomial NLL of the sampled keep-count vs prior rate pi.
+    # Budget loss. "onesided_global": one-sided ReLU hinge on the TOTAL kept count
+    # across all layers/heads vs pi * total_slots -- only over-budget is penalized,
+    # so layers/heads/positions may compress unequally (DMS-style adaptive CR).
+    # "binomial": legacy per-layer binomial NLL pinned to pi (both sides).
+    budget_mode: str = "onesided_global"
     budget_weight: float = 0.1
     budget_hard_count: bool = True  # count hard STE samples (else soft concrete)
     entropy_weight: float = 0.0
     load_balance_weight: float = 0.0
 
-    # Losses
-    ce_weight: float = 1.0
-    use_kl_teacher: bool = False
+    # Losses. DMS retrofits purely via logit distillation (teacher = original,
+    # un-adapted, full-KV model). We follow that: KL to the offline teacher is
+    # the primary objective and on by default; CE on the gold answer is a light
+    # auxiliary anchor. (Requires precomputed teacher logits -- run
+    # scripts/precompute_teacher.py first; otherwise KL is silently skipped.)
+    ce_weight: float = 0.1
+    use_kl_teacher: bool = True
     kl_weight: float = 1.0
     kl_top_k: int = 128
     teacher_dir: str = "outputs_v2/teacher"  # offline precomputed top-k logits

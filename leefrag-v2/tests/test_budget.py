@@ -13,7 +13,9 @@ from leefrag_v2.training.budget import budget_binomial_loss
 
 def _const_logit_selector(bias: float, hidden_size: int):
     """Selector whose logit == `bias` for every token (zero all weights, keep biases)."""
-    s = LayerSelector(SelectorConfig(trunk_dim=16, head_bias_init=bias), 1, hidden_size)
+    s = LayerSelector(
+        SelectorConfig(trunk_dim=16, head_bias_init=bias, per_head=False), 1, hidden_size
+    )
     with torch.no_grad():
         for p in s.parameters():
             if p.dim() > 1:  # weight matrices -> 0  (biases, incl. head bias, kept)

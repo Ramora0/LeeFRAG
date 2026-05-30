@@ -18,7 +18,12 @@ import torch
 
 from transformers.models.llama.modeling_llama import apply_rotary_pos_emb, repeat_kv
 
-from leefrag_v2.model.selector import gumbel_sigmoid_ste, topk_keep_gate
+from leefrag_v2.model.selector import (
+    gumbel_sigmoid_ste,
+    topk_keep_gate,
+    topk_keep_gate_global,
+    topk_keep_gate_perhead,
+)
 
 
 def _dense_attention(q, k, v, add_mask, scaling, n_rep):
@@ -51,14 +56,23 @@ def _compute_gate(attn_module, ctx, hidden_states, layer_idx, D):
 
     logits = ctx.selector(chunk_hidden, layer_idx)  # [1, D] fp32, full graph
 
+    per_head = logits.dim() == 3  # [1, Hkv, D] when selector.per_head else [1, D]
     if attn_module.training:
         noise = ctx.noise[layer_idx] if ctx.noise is not None else None
         gate = gumbel_sigmoid_ste(logits, tau=ctx.tau, noise=noise, hard=True, training=True)
     elif ctx.eval_pi is not None:
-        gate = topk_keep_gate(logits, ctx.eval_pi)
+        if per_head:
+            mode = getattr(ctx.selector.cfg, "per_head_eval", "equal")
+            gate = (
+                topk_keep_gate_global(logits, ctx.eval_pi)
+                if mode == "global"
+                else topk_keep_gate_perhead(logits, ctx.eval_pi)
+            )
+        else:
+            gate = topk_keep_gate(logits, ctx.eval_pi)
     else:
         gate = (torch.sigmoid(logits) > 0.5).float()
-    return gate.view(1, D)
+    return gate  # [1, D] (per-layer) or [1, Hkv, D] (per-head)
 
 
 def patched_llama_attention_forward(
@@ -129,8 +143,14 @@ def patched_llama_attention_forward(
 
             gate = _compute_gate(self, ctx, hidden_states, layer_idx, D)
             if gate is not None:
-                probs_c = probs_c * gate.view(1, 1, 1, D)  # post-softmax, no renorm
-                if ctx.gate_renorm:  # ablation only
+                if gate.dim() == 3:  # per-head [1, Hkv, D] -> broadcast to query heads
+                    g = gate.repeat_interleave(n_rep, dim=1).unsqueeze(2)  # [1, Hq, 1, D]
+                else:  # per-layer [1, D]
+                    g = gate.view(1, 1, 1, D)
+                probs_c = probs_c * g  # post-softmax gate
+                if ctx.gate_renorm:
+                    # With a hard gate this == pre-softmax masking: softmax over
+                    # (kept chunk keys + Q+A), matching real KV eviction at eval.
                     denom = (
                         probs_c.sum(-1, keepdim=True) + probs_a.sum(-1, keepdim=True)
                     ).clamp_min(1e-9)
@@ -153,7 +173,8 @@ def patched_llama_attention_forward(
 
 
 def reference_dense_attention(
-    q, k, v, block_lengths, qa_len, scaling, num_q_heads, num_kv_heads, gate=None
+    q, k, v, block_lengths, qa_len, scaling, num_q_heads, num_kv_heads, gate=None,
+    gate_renorm=False,
 ):
     """Ground-truth single dense attention for parity checks (milestone 1).
 
@@ -176,4 +197,8 @@ def reference_dense_attention(
         mult = torch.ones_like(probs)
         mult[:, :, D:, :D] = gate.view(1, 1, 1, D)
         probs = probs * mult
+        if gate_renorm:
+            # renormalize the Q+A rows over their (kept chunk + Q+A) keys
+            row = probs[:, :, D:, :]
+            probs[:, :, D:, :] = row / row.sum(-1, keepdim=True).clamp_min(1e-9)
     return torch.matmul(probs.to(v.dtype), v_rep)

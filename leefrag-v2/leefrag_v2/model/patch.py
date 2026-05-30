@@ -90,10 +90,16 @@ def set_context(model, ctx: ForwardContext | None) -> None:
         module._v2ctx = ctx
 
 
-def sample_step_noise(num_layers: int, D: int, device, generator=None) -> list:
-    """Pre-sample per-layer logistic noise [1, D] (so checkpoint recompute replays it)."""
+def sample_step_noise(
+    num_layers: int, D: int, device, generator=None, num_heads: int = 1
+) -> list:
+    """Pre-sample per-layer logistic noise (so checkpoint recompute replays it).
+
+    Shape [1, D] for per-layer selection, or [1, num_heads, D] for per-head.
+    """
+    shape = (1, D) if num_heads <= 1 else (1, num_heads, D)
     return [
-        sample_logistic_noise((1, D), device, generator=generator)
+        sample_logistic_noise(shape, device, generator=generator)
         for _ in range(num_layers)
     ]
 

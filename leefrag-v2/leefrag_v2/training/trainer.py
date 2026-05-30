@@ -19,7 +19,11 @@ from leefrag_v2.config import SelectorConfig, V2ModelConfig, V2TrainingConfig
 from leefrag_v2.data.adapter import build_blocks
 from leefrag_v2.model.patch import new_context, sample_step_noise, set_context
 from leefrag_v2.model.peft_setup import collect_param_groups
-from leefrag_v2.training.budget import KeepRateScheduler, budget_binomial_loss
+from leefrag_v2.training.budget import (
+    KeepRateScheduler,
+    budget_binomial_loss,
+    budget_onesided_global,
+)
 from leefrag_v2.training.losses import ce_on_answer, kl_to_teacher
 
 logger = logging.getLogger(__name__)
@@ -50,6 +54,21 @@ class V2Trainer:
         self.num_layers = model_config.num_layers
         self.mode = training_config.mode
 
+        # KL distillation is the primary loss; with ce_weight low, a missing
+        # teacher dir would silently gut training. Fail loudly at init instead.
+        if training_config.use_kl_teacher:
+            td = training_config.teacher_dir
+            has_teacher = os.path.isdir(td) and any(
+                f.endswith(".pt") for f in os.listdir(td)
+            )
+            if not has_teacher:
+                logger.warning(
+                    "use_kl_teacher=True but no teacher logits (*.pt) found in %r. "
+                    "KL will be skipped and training will run on ce_weight=%g CE "
+                    "alone -- run scripts/precompute_teacher.py first.",
+                    td, training_config.ce_weight,
+                )
+
         steps_per_epoch = math.ceil(
             len(train_loader) / training_config.gradient_accumulation_steps
         )
@@ -57,7 +76,10 @@ class V2Trainer:
         self.steps_per_epoch = steps_per_epoch
 
         self.keep_rate_scheduler = KeepRateScheduler(
-            training_config.keep_rate_schedule, self.total_steps
+            training_config.keep_rate_schedule, self.total_steps,
+            mode=training_config.keep_rate_mode,
+            pi_min=training_config.keep_rate_min,
+            pi_max=training_config.keep_rate_max,
         )
         if training_config.eval_steps is None:
             training_config.eval_steps = max(1, self.keep_rate_scheduler.steps_per_phase // 4)
@@ -141,7 +163,10 @@ class V2Trainer:
         tau = self._tau(step)
 
         if self.mode == "learned":
-            noise = sample_step_noise(self.num_layers, D, self.device)
+            num_heads = self.mc.num_kv_heads if self.sc.per_head else 1
+            noise = sample_step_noise(
+                self.num_layers, D, self.device, num_heads=num_heads
+            )
             ctx = new_context(
                 blocks["block_lengths"], blocks["qa_len"], self.device, self.num_layers,
                 use_flex=self.cfg.use_flex, selector=self.selector, tau=tau,
@@ -165,7 +190,12 @@ class V2Trainer:
         metrics = {"ce": ce.item(), "pi": pi, "tau": tau, "budget": 0.0, "keep": 0.0, "kl": 0.0}
 
         if self.mode == "learned":
-            budget, keep = budget_binomial_loss(
+            budget_fn = (
+                budget_onesided_global
+                if self.cfg.budget_mode == "onesided_global"
+                else budget_binomial_loss
+            )
+            budget, keep = budget_fn(
                 ctx.captured_chunk_hidden, self.selector, pi, tau, ctx.noise,
                 self.device, hard=self.cfg.budget_hard_count,
             )
@@ -234,13 +264,19 @@ class V2Trainer:
         logger.info("Training complete.")
 
     def _run_eval(self, step: int):
-        pi = self.keep_rate_scheduler.get_pi(step)
-        ce = self.evaluate(pi)
-        tqdm.write(f"eval @ {step}: CE={ce:.4f} ppl={math.exp(min(ce,20)):.2f} pi={pi:.3f}")
+        # Sweep a family of keep-rates from the one checkpoint (DMS-style).
+        pis = self.cfg.eval_pis or [self.keep_rate_scheduler.get_pi(step)]
+        logs = {"train/step": step}
+        for pi in pis:
+            ce = self.evaluate(pi)
+            ppl = math.exp(min(ce, 20))
+            tqdm.write(f"eval @ {step}: pi={pi:.3f} CE={ce:.4f} ppl={ppl:.2f}")
+            logs[f"eval/ce@{pi:g}"] = ce
+            logs[f"eval/ppl@{pi:g}"] = ppl
         if self.use_wandb:
             import wandb
 
-            wandb.log({"eval/ce": ce, "eval/ppl": math.exp(min(ce, 20)), "eval/pi": pi, "train/step": step})
+            wandb.log(logs)
         self.model.train()
         if self.selector is not None:
             self.selector.train()
